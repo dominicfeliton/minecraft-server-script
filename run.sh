@@ -26,7 +26,7 @@
 SERVER_DIR="/Users/dominicfeliton/Documents/spigot_wwc_test_server"
 TMUX_SESSION_NAME="$(basename "$SERVER_DIR")"
 
-PROJECT_NAME="spigot"  # "paper", "velocity", "folia", or "spigot"
+: "${PROJECT_NAME:=paper}"  # "paper", "velocity", "folia", or "spigot"
 
 CURRENT_VERSION_FILE="${SERVER_DIR}/current_version.txt"
 DEFAULT_WORLD_NAME="world"
