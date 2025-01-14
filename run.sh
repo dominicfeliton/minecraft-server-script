@@ -39,12 +39,12 @@ DEFAULT_XMX="2G"
 JAVA_CMD="java"  # Overridden by --java-cmd= if passed
 
 # --- FOLIA-RELATED CONFIG ---
-FOLIA_SRC_DIR="/home/minecraft/FoliaSource"   # local Git clone
+: "${FOLIA_SRC_DIR:=/home/minecraft/FoliaSource}"   # local Git clone
 FOLIA_GIT_URL="https://github.com/PaperMC/Folia.git"
 FOLIA_BRANCH="master"    # or "main", etc.
 
 # Docker build context directory
-FOLIA_DOCKER_CTX="/home/minecraft/folia_docker_build"
+: "${FOLIA_DOCKER_CTX=/home/minecraft/folia_docker_build}"
 
 # --- SPIGOT-RELATED CONFIG ---
 # Where we keep or download BuildTools:
