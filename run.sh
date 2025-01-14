@@ -15,15 +15,17 @@
 #  - Paper/Velocity: fetch builds from PaperMC’s API.
 #  - Spigot: downloads BuildTools and compiles the requested MC version.
 #  - Backup & clean the old world folders when version changes (Paper/Folia/Spigot).
-#  - (Optional) Aikar flags, memory, tmux usage, etc.
+#  - **Auto-agree to the EULA** (no manual editing).
+#  - (Optional) Aikar flags, memory, tmux usage, WSL detection, etc.
 #
 # Adjust paths and environment details as needed!
+#
 
 ########################################
 #            CONFIGURATION             #
 ########################################
 
-: "${SERVER_DIR:=/Users/dominicfeliton/Documents/spigot_wwc_test_server}"
+: "${SERVER_DIR:=/tmp/wwc_test_server}"
 TMUX_SESSION_NAME="$(basename "$SERVER_DIR")"
 
 : "${PROJECT_NAME:=paper}"  # "paper", "velocity", "folia", or "spigot"
@@ -80,21 +82,22 @@ EOF
 # For Paper/Velocity/Spigot => we need curl & jq
 if [[ "$PROJECT_NAME" != "folia" ]]; then
   if ! command -v curl &>/dev/null; then
-    echo "Error: 'curl' is required. Install it first."
+    echo "Error: 'curl' is required. Install it with your package manager first."
     exit 1
   fi
   if [[ "$PROJECT_NAME" != "spigot" ]]; then
     # spigot doesn't absolutely require jq for build, but Paper/Velocity do
     if ! command -v jq &>/dev/null; then
-      echo "Error: 'jq' is required for Paper/Velocity. Install it first."
+      echo "Error: 'jq' is required for Paper/Velocity. Install it with your package manager first."
       exit 1
     fi
   fi
 fi
 
 if [[ ! -d "${SERVER_DIR}" ]]; then
-  echo "Error: SERVER_DIR '${SERVER_DIR}' does not exist."
-  exit 1
+  echo "Error: SERVER_DIR '${SERVER_DIR}' does not exist. Creating..."
+  mkdir -p "${SERVER_DIR}"
+  #exit 1
 fi
 
 ########################################
@@ -309,6 +312,15 @@ VELOCITY_FLAGS_BASE=(
 )
 
 ########################################
+#      DETECT WSL ENVIRONMENT          #
+########################################
+
+function is_wsl() {
+  # A simple check: if /proc/version contains "Microsoft" or "WSL"
+  grep -qiE "(Microsoft|WSL)" /proc/version 2>/dev/null
+}
+
+########################################
 #   DOCKER-BASED FOLIA BUILD (JDK 22)  #
 ########################################
 
@@ -338,8 +350,10 @@ function docker_build_folia_if_needed() {
   git fetch origin
   [[ $? -ne 0 ]] && { echo "Error: git fetch failed."; exit 1; }
 
-  local LOCAL_HASH="$(git rev-parse HEAD)"
-  local REMOTE_HASH="$(git rev-parse origin/$FOLIA_BRANCH)"
+  local LOCAL_HASH
+  LOCAL_HASH="$(git rev-parse HEAD)"
+  local REMOTE_HASH
+  REMOTE_HASH="$(git rev-parse origin/$FOLIA_BRANCH)"
   echo "[Folia] Local HEAD:  $LOCAL_HASH"
   echo "[Folia] Remote HEAD: $REMOTE_HASH"
 
@@ -382,10 +396,10 @@ function docker_build_folia() {
 
   mkdir -p "$FOLIA_DOCKER_CTX"
 
-  # 1) Sync Folia source to build context (we do it first):
+  # 1) Sync Folia source to build context:
   rsync -av --delete "$FOLIA_SRC_DIR/" "$FOLIA_DOCKER_CTX/"
 
-  # 2) Create Dockerfile (AFTER rsync, so it won't get deleted)
+  # 2) Create Dockerfile (AFTER rsync, so it won't get overwritten)
   cat > "$FOLIA_DOCKER_CTX/Dockerfile" << 'EOF'
 FROM openjdk:22-jdk-bookworm
 
@@ -422,6 +436,7 @@ EOF
   docker cp tempfolia:/FoliaSource/build/libs/ "$SERVER_DIR"/build-output
 
   # rename the newest .jar to folia-server.jar
+  local BUILT_JAR
   BUILT_JAR="$(find "${SERVER_DIR}/build-output" -type f -name '*.jar' | sort -r | head -n1)"
   if [[ -z "$BUILT_JAR" ]]; then
     echo "Error: No JAR found in build-output!"
@@ -443,14 +458,13 @@ EOF
 ########################################
 
 function build_spigot_if_needed() {
-  # We rely on 'git' and 'mvn' (Maven) typically. 
-  # Check for them if needed:
+  # We rely on 'git' and 'mvn' (Maven) typically.
   if ! command -v git &>/dev/null; then
     echo "Error: 'git' is required to build Spigot with BuildTools."
     exit 1
   fi
   if ! command -v mvn &>/dev/null; then
-    echo "Warning: 'mvn' not found. BuildTools may download Maven itself, but prefer installing it if fails."
+    echo "Warning: 'mvn' not found. BuildTools may download Maven itself."
   fi
 
   mkdir -p "$SPIGOT_BUILD_DIR"
@@ -464,7 +478,7 @@ function build_spigot_if_needed() {
       echo "[Spigot] Auto-update => re-download BuildTools.jar"
       curl -sSL "$BUILD_TOOLS_JAR_URL" -o "$BUILD_TOOLS_JAR"
     else
-      echo "[Spigot] BuildTools.jar already exists, no re-download (auto-update=OFF)."
+      echo "[Spigot] BuildTools.jar already exists; no re-download (auto-update=OFF)."
     fi
   fi
 
@@ -474,15 +488,12 @@ function build_spigot_if_needed() {
       MINECRAFT_VERSION="$(< "$CURRENT_VERSION_FILE")"
       echo "[Spigot] No version specified => using $MINECRAFT_VERSION from current_version.txt"
     else
-      # Hardcode a fallback, e.g. 1.20.1. Or let user specify?
       echo "[Spigot] No version specified + no current_version.txt => using 1.20.1"
       MINECRAFT_VERSION="1.20.1"
     fi
   fi
 
   # If spigot-server.jar for that version is present & auto-update=OFF => skip
-  # We'll look for "spigot-server.jar". If you want multi-version handling, 
-  # you might want a different naming scheme. For simplicity, we overwrite it.
   if [[ -f "$SPIGOT_BUILT_JAR" && "$AUTO_UPDATE" == "false" ]]; then
     echo "[Spigot] spigot-server.jar present, auto-update=OFF => using existing jar."
     return 0
@@ -501,13 +512,14 @@ function build_spigot_if_needed() {
     exit 1
   fi
 
-  local BUILT_SPIGOT_JAR="${SPIGOT_BUILD_DIR}/spigot-${MINECRAFT_VERSION}.jar"
-  if [[ -z "$BUILT_SPIGOT_JAR" ]]; then
+  local BUILT_SPIGOT_JAR
+  BUILT_SPIGOT_JAR="${SPIGOT_BUILD_DIR}/spigot-${MINECRAFT_VERSION}.jar"
+  if [[ -z "$BUILT_SPIGOT_JAR" || ! -f "$BUILT_SPIGOT_JAR" ]]; then
     echo "Error: No spigot-*.jar found in ${SPIGOT_BUILD_DIR}."
     exit 1
   fi
 
-  # Move to server folder as spigot-server.jar (or rename as you prefer)
+  # Move to server folder as spigot-server.jar
   cp "$BUILT_SPIGOT_JAR" "$SPIGOT_BUILT_JAR"
   popd >/dev/null || exit 1
 
@@ -525,7 +537,8 @@ backup_and_clean() {
   echo "Version changed from '${old_version}' to '${new_version}'."
   echo "Backup + clean..."
 
-  local timestamp="$(date +%Y%m%d-%H%M%S)"
+  local timestamp
+  timestamp="$(date +%Y%m%d-%H%M%S)"
   local randstr=$(( RANDOM % 10000 ))
   local backup_dir="${SERVER_DIR}/${DEFAULT_WORLD_NAME}-${old_version}-${timestamp}-${randstr}"
 
@@ -582,7 +595,7 @@ maybe_backup_and_clean() {
 ########################################
 
 remove_old_jars() {
-  # For spigot or folia, we skip this function (they have separate logic).
+  # For spigot or folia, skip this function (they have separate logic).
   if [[ "$PROJECT_NAME" == "folia" || "$PROJECT_NAME" == "spigot" ]]; then
     echo "[${PROJECT_NAME}] Skipping remove_old_jars..."
     return
@@ -644,22 +657,36 @@ elif [[ "$PROJECT_NAME" == "spigot" ]]; then
 fi
 
 ########################################
+#  AUTO-ACCEPT EULA (IF DESIRED)       #
+########################################
+
+function ensure_eula() {
+  local eulaFile="${SERVER_DIR}/eula.txt"
+  if [[ ! -f "$eulaFile" ]]; then
+    echo "eula.txt not found; creating it with eula=true"
+    echo "eula=true" > "$eulaFile"
+  else
+    # If line "eula=false" exists, replace it
+    if grep -q '^eula=false' "$eulaFile"; then
+      sed -i 's/eula=false/eula=true/' "$eulaFile"
+      echo "Set eula=true in $eulaFile"
+    fi
+  fi
+}
+
+########################################
 #        MAIN START SEQUENCE           #
 ########################################
 
 maybe_backup_and_clean
 
-# ---- FOLIA ----
+# Build or fetch server jar as needed
 if [[ "$PROJECT_NAME" == "folia" ]]; then
   docker_build_folia_if_needed
-
-# ---- SPIGOT ----
 elif [[ "$PROJECT_NAME" == "spigot" ]]; then
   build_spigot_if_needed
   [[ -n "$MINECRAFT_VERSION" ]] && echo "$MINECRAFT_VERSION" > "$CURRENT_VERSION_FILE"
-
-# ---- PAPER or VELOCITY ----
-else
+elif [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" ]]; then
   remove_old_jars
   download_jar
   [[ -n "$MINECRAFT_VERSION" ]] && echo "$MINECRAFT_VERSION" > "$CURRENT_VERSION_FILE"
@@ -671,6 +698,9 @@ cd "${SERVER_DIR}" || {
 }
 
 mkdir -p logs
+
+# Make sure eula.txt is accepted
+ensure_eula
 
 echo "----------------------------------------"
 echo "PROJECT_NAME         = ${PROJECT_NAME}"
@@ -691,6 +721,7 @@ echo "----------------------------------------"
 
 echo "Starting ${PROJECT_NAME} server..."
 
+# Build Java flags
 if [[ "$PROJECT_NAME" == "velocity" ]]; then
   SERVER_FLAGS=(
     "-Xms${XMS}"
@@ -705,7 +736,6 @@ elif [[ "$PROJECT_NAME" == "folia" ]]; then
     "${GC_LOGGING_FLAGS[@]}"
   )
 elif [[ "$PROJECT_NAME" == "spigot" ]]; then
-  # You can reuse Aikar flags, or omit them. We'll reuse them for consistency:
   SERVER_FLAGS=(
     "-Xms${XMS}"
     "-Xmx${XMX}"
@@ -731,6 +761,25 @@ echo "Server Flags  : ${SERVER_FLAGS[*]}"
 echo "Extra Args    : ${EXTRA_ARGS}"
 echo "----------------------------------------"
 
+function print_connection_info() {
+  if is_wsl; then
+    # Grab the first IP from hostname -I
+    local ipAddr
+    ipAddr="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -z "$ipAddr" ]]; then
+      ipAddr="(WSL IP not detected automatically)"
+    fi
+    echo "======================================================"
+    echo "WSL DETECTED! Use ${ipAddr}:25565 to connect from your Windows host."
+    echo "======================================================"
+  else
+    echo "======================================================"
+    echo "NON-WSL ENVIRONMENT! Use localhost:25565 to connect."
+    echo "======================================================"
+  fi
+}
+
+# Start the server
 if [[ "$USE_TMUX" == "true" ]]; then
   if tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
     echo "tmux session '$TMUX_SESSION_NAME' exists! Aborting start."
@@ -739,6 +788,8 @@ if [[ "$USE_TMUX" == "true" ]]; then
   tmux new-session -d -s "$TMUX_SESSION_NAME" \
     "${JAVA_CMD} ${SERVER_FLAGS[*]} -jar \"${FILE}\" ${EXTRA_ARGS}"
   echo "Server started in tmux session '$TMUX_SESSION_NAME'."
+  print_connection_info
 else
+  print_connection_info
   exec "${JAVA_CMD}" "${SERVER_FLAGS[@]}" -jar "${FILE}" ${EXTRA_ARGS}
 fi
