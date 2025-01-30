@@ -413,7 +413,7 @@ WORKDIR /FoliaSource
 COPY . /FoliaSource
 
 # Build Folia
-RUN ./gradlew applyPatches && ./gradlew createReobfBundlerJar
+RUN ./gradlew applyPatches && ./gradlew createMojmapBundlerJar
 EOF
 
   # 3) Build the Docker image
