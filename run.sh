@@ -401,10 +401,10 @@ function docker_build_folia() {
 
   # 2) Create Dockerfile (AFTER rsync, so it won't get overwritten)
   cat > "$FOLIA_DOCKER_CTX/Dockerfile" << 'EOF'
-FROM openjdk:22-jdk-bookworm
+FROM amazoncorretto:21
 
-# We'll install any missing tools like git, xargs, patch, etc. if needed
-RUN apt-get update && apt-get upgrade -y && apt-get install -y git findutils
+# Install missing tools using yum
+RUN yum update -y && yum install -y git findutils
 
 RUN git config --global user.name "Test User"
 RUN git config --global user.email "testemail@test.com"
