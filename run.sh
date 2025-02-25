@@ -413,7 +413,7 @@ RUN git config --global user.email "testemail@test.com"
 WORKDIR /FoliaSource
 COPY . /FoliaSource
 
-# Build Folia
+# Build Folia - note that we're using applyAllPatches instead of just applyPatches
 RUN ./gradlew applyAllPatches && ./gradlew createMojmapBundlerJar
 EOF
 
@@ -426,6 +426,7 @@ EOF
   fi
 
   # 4) Create container so we can docker cp
+  echo "[Folia] Creating temporary container to extract files..."
   docker create --name tempfolia local-folia:latest
   if [[ $? -ne 0 ]]; then
     echo "Error: docker create failed. Exiting."
@@ -436,43 +437,25 @@ EOF
   local temp_output_dir="${SERVER_DIR}/build-output"
   mkdir -p "$temp_output_dir"
   
-  # 6) Search for Folia bundler jar in potential locations
-  echo "[Folia] Searching for bundler jar in container..."
+  # 6) Copy out build directories that might contain our jar files
+  echo "[Folia] Copying potential jar locations from container..."
   
-  # First, try to find all potential bundler jar files in the container
-  # This command creates a script inside the container that finds all files that match the pattern
-  docker exec tempfolia sh -c "find /FoliaSource -type f -name '*bundler*mojmap.jar' -o -name '*mojmap*bundler.jar'" > "$temp_output_dir/bundler_paths.txt"
+  # Try common locations where jar files might be found
+  declare -a jar_locations=(
+    "/FoliaSource/build/libs"
+    "/FoliaSource/folia-server/build/libs" 
+    "/FoliaSource/server/build/libs"
+    "/FoliaSource/paper-server/build/libs"
+  )
   
-  if [ ! -s "$temp_output_dir/bundler_paths.txt" ]; then
-    echo "[Folia] No bundler jar found with specific pattern. Trying broader search..."
-    # If no specific bundler jar is found, try a broader search for any mojmap jar
-    docker exec tempfolia sh -c "find /FoliaSource -type f -name '*mojmap*.jar'" > "$temp_output_dir/bundler_paths.txt"
-  fi
-  
-  if [ ! -s "$temp_output_dir/bundler_paths.txt" ]; then
-    echo "[Folia] Still no jars found. Trying even broader search for any jar..."
-    # Last resort - try to find any jar files
-    docker exec tempfolia sh -c "find /FoliaSource -path '*/build/libs/*.jar'" > "$temp_output_dir/bundler_paths.txt"
-  fi
-  
-  # Check if we found any paths
-  if [ ! -s "$temp_output_dir/bundler_paths.txt" ]; then
-    echo "Error: Could not find any jar files in the container!"
-    docker rm tempfolia >/dev/null 2>&1
-    exit 1
-  fi
-  
-  # Copy each found jar file to our temp directory
-  while read -r jar_path; do
-    if [ -n "$jar_path" ]; then
-      echo "[Folia] Found jar: $jar_path"
-      local jar_filename=$(basename "$jar_path")
-      docker cp "tempfolia:$jar_path" "$temp_output_dir/$jar_filename"
-      echo "[Folia] Copied: $jar_filename"
-    fi
-  done < "$temp_output_dir/bundler_paths.txt"
+  # Loop through locations and try to copy each one
+  for location in "${jar_locations[@]}"; do
+    echo "[Folia] Trying to copy from: $location"
+    docker cp "tempfolia:$location" "$temp_output_dir/" 2>/dev/null || true
+  done
   
   # 7) Find the most appropriate jar to use as server jar
+  echo "[Folia] Searching for jar files in extracted directories..."
   local BUILT_JAR=""
   
   # First priority: bundler jars with mojmap in the name
@@ -483,21 +466,46 @@ EOF
     BUILT_JAR="$(find "$temp_output_dir" -type f -name '*mojmap*.jar' | sort -r | head -n1)"
   fi
   
-  # Third priority: any jar file
+  # Third priority: any bundler jar
+  if [[ -z "$BUILT_JAR" ]]; then
+    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*bundler*.jar' | sort -r | head -n1)"
+  fi
+  
+  # Fourth priority: any jar file with folia in the name
+  if [[ -z "$BUILT_JAR" ]]; then
+    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*folia*.jar' | sort -r | head -n1)"
+  fi
+  
+  # Last resort: any jar file
   if [[ -z "$BUILT_JAR" ]]; then
     BUILT_JAR="$(find "$temp_output_dir" -type f -name '*.jar' | sort -r | head -n1)"
   fi
   
   if [[ -z "$BUILT_JAR" ]]; then
-    echo "Error: No JAR found in build-output after copying!"
-    docker rm tempfolia >/dev/null 2>&1
-    exit 1
+    echo "Error: No JAR found in extracted directories. Let's try one more method..."
+    
+    # Try a direct command to list all jar files in the container and copy them one by one
+    docker run --rm -v "$temp_output_dir:/output" local-folia:latest \
+      sh -c "find /FoliaSource -name '*.jar' -exec cp {} /output/ \;"
+    
+    # Look for jars again
+    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*bundler*mojmap*.jar' | sort -r | head -n1)"
+    if [[ -z "$BUILT_JAR" ]]; then
+      BUILT_JAR="$(find "$temp_output_dir" -type f -name '*.jar' | sort -r | head -n1)"
+    fi
+    
+    if [[ -z "$BUILT_JAR" ]]; then
+      echo "Error: Still no JAR found. Unable to proceed."
+      docker rm tempfolia >/dev/null 2>&1
+      exit 1
+    fi
   fi
   
   echo "[Folia] Using jar: $(basename "$BUILT_JAR")"
-  mv "$BUILT_JAR" "${SERVER_DIR}/folia-server.jar"
+  cp "$BUILT_JAR" "${SERVER_DIR}/folia-server.jar"
   
   # 8) Cleanup
+  echo "[Folia] Cleaning up temporary files and container..."
   rm -rf "$temp_output_dir"
   docker rm tempfolia >/dev/null 2>&1
 
