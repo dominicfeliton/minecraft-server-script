@@ -1,58 +1,112 @@
 #!/usr/bin/env bash
 
-#
-# Subcommands:
-#   start    : Start the server (updates/backups/cleanups, etc.)
-#   stop     : Stop via tmux (if running) and kill the session
-#   restart  : Stop then start
-#   toggle   : If running, stop. Otherwise start.
-#
-# Environment variable:
-#   PROJECT_NAME : "paper" (default), "velocity", "folia", or "spigot"
-#
-# Key features:
-#  - Folia: checks a local Git repo for upstream changes and builds in Docker (OpenJDK 22).
-#  - Paper/Velocity: fetch builds from PaperMC's API.
-#  - Spigot: downloads BuildTools and compiles the requested MC version.
-#  - Backup & clean the old world folders when version changes (Paper/Folia/Spigot).
-#  - **Auto-agree to the EULA** (no manual editing).
-#  - (Optional) Aikar flags, memory, tmux usage, WSL detection, etc.
-#
-# Adjust paths and environment details as needed!
-#
-
 ########################################
 #            CONFIGURATION             #
 ########################################
 
-: "${SERVER_DIR:=/tmp/wwc_test_server}"
-TMUX_SESSION_NAME="$(basename "$SERVER_DIR")"
+# These are defaults - they can be overridden by:
+# 1. Environment variables (highest priority)
+# 2. Config file (server.conf, .serverrc, etc.)
+# 3. These defaults (lowest priority)
 
-: "${PROJECT_NAME:=paper}"  # "paper", "velocity", "folia", or "spigot"
+# Will be set by config or environment, with fallback defaults
+SERVER_DIR="${SERVER_DIR:-}"
+PROJECT_NAME="${PROJECT_NAME:-}"
+DEFAULT_WORLD_NAME="${DEFAULT_WORLD_NAME:-}"
+DEFAULT_XMS="${DEFAULT_XMS:-}"
+DEFAULT_XMX="${DEFAULT_XMX:-}"
+JAVA_CMD="${JAVA_CMD:-}"
+FOLIA_SRC_DIR="${FOLIA_SRC_DIR:-}"
+FOLIA_GIT_URL="${FOLIA_GIT_URL:-}"
+FOLIA_BRANCH="${FOLIA_BRANCH:-}"
+FOLIA_DOCKER_CTX="${FOLIA_DOCKER_CTX:-}"
+SPIGOT_BUILD_DIR="${SPIGOT_BUILD_DIR:-}"
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-}"
+AUTO_AGREE_EULA="${AUTO_AGREE_EULA:-}"
 
+########################################
+#          CONFIG FILE LOADING         #
+########################################
+
+load_config() {
+  # Determine where to look for config
+  # If SERVER_DIR is set, look there first
+  local search_dir="${SERVER_DIR:-$(pwd)}"
+  
+  local config_files=(
+    "${search_dir}/server.conf"
+    "${search_dir}/.serverrc"
+    "${HOME}/.minecraft-server.conf"
+    "/etc/minecraft-server.conf"
+  )
+
+  local config_loaded=false
+
+  for config_file in "${config_files[@]}"; do
+    if [[ -f "$config_file" ]]; then
+      echo "Loading config from: $config_file"
+      
+      while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        
+        # Remove leading/trailing whitespace
+        key="$(echo "$key" | xargs)"
+        value="$(echo "$value" | xargs)"
+        
+        # Remove quotes from value if present
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        
+        # Only set if variable is currently empty
+        # This allows environment variables to take priority
+        case "$key" in
+          SERVER_DIR|PROJECT_NAME|DEFAULT_WORLD_NAME|DEFAULT_XMS|DEFAULT_XMX|\
+          JAVA_CMD|FOLIA_SRC_DIR|FOLIA_GIT_URL|FOLIA_BRANCH|FOLIA_DOCKER_CTX|\
+          SPIGOT_BUILD_DIR|TMUX_SESSION_NAME|AUTO_AGREE_EULA)
+            if [[ -z "${!key}" ]]; then
+              declare -g "$key=$value"
+            fi
+            ;;
+        esac
+      done < "$config_file"
+      
+      config_loaded=true
+      break  # Only load first config found
+    fi
+  done
+  
+  if [[ "$config_loaded" == "false" ]]; then
+    echo "No config file found, using defaults/environment variables."
+  fi
+}
+
+# Load config
+load_config
+
+# Apply defaults for anything still unset
+: "${SERVER_DIR:=$(pwd)}"
+: "${PROJECT_NAME:=paper}"
+: "${DEFAULT_WORLD_NAME:=world}"
+: "${DEFAULT_XMS:=2G}"
+: "${DEFAULT_XMX:=2G}"
+: "${JAVA_CMD:=java}"
+: "${FOLIA_SRC_DIR:=/home/minecraft/FoliaSource}"
+: "${FOLIA_GIT_URL:=https://github.com/PaperMC/Folia.git}"
+: "${FOLIA_BRANCH:=dev/hard-fork}"
+: "${FOLIA_DOCKER_CTX:=/home/minecraft/folia_docker_build}"
+: "${AUTO_AGREE_EULA:=true}"
+
+# Derived variables (depend on SERVER_DIR)
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-$(basename "$SERVER_DIR")}"
 CURRENT_VERSION_FILE="${SERVER_DIR}/current_version.txt"
-DEFAULT_WORLD_NAME="world"
-
-DEFAULT_XMS="2G"
-DEFAULT_XMX="2G"
-
-JAVA_CMD="java"  # Overridden by --java-cmd= if passed
-
-# --- FOLIA-RELATED CONFIG ---
-: "${FOLIA_SRC_DIR:=/home/minecraft/FoliaSource}"   # local Git clone
-FOLIA_GIT_URL="https://github.com/PaperMC/Folia.git"
-#FOLIA_BRANCH="master"    # or "main", etc.
-FOLIA_BRANCH="dev/hard-fork"
-
-# Docker build context directory
-: "${FOLIA_DOCKER_CTX=/home/minecraft/folia_docker_build}"
-
-# --- SPIGOT-RELATED CONFIG ---
-# Where we keep or download BuildTools:
-SPIGOT_BUILD_DIR="${SERVER_DIR}/buildtools"
-BUILD_TOOLS_JAR_URL="https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar"
+SPIGOT_BUILD_DIR="${SPIGOT_BUILD_DIR:-${SERVER_DIR}/buildtools}"
 BUILD_TOOLS_JAR="${SPIGOT_BUILD_DIR}/BuildTools.jar"
 SPIGOT_BUILT_JAR="${SERVER_DIR}/spigot-server.jar"
+BUILD_TOOLS_JAR_URL="https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar"
 
 ########################################
 #             USAGE & HELP             #
