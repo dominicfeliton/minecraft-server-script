@@ -667,19 +667,21 @@ download_jar() {
   if [[ -f "${FILE}" ]]; then
     if [[ "$AUTO_UPDATE" == "true" ]]; then
       echo "Auto-update ON => re-download if changed..."
-      curl -sSL "${BUILD_API_URL}/downloads/${JAR_NAME}" -o "${FILE}"
+      curl -sSL -H "User-Agent: $USER_AGENT" "${DOWNLOAD_URL}" -o "${FILE}"
     else
       echo "Auto-update OFF => skip download."
     fi
   else
-    echo "Downloading ${JAR_NAME}..."
-    curl -sSL "${BUILD_API_URL}/downloads/${JAR_NAME}" -o "${FILE}"
+    echo "Downloading ${JAR_NAME} from ${DOWNLOAD_URL}..."
+    curl -sSL -H "User-Agent: $USER_AGENT" "${DOWNLOAD_URL}" -o "${FILE}"
   fi
 }
 
 ########################################
 #      PAPER/VELOCITY BUILD INFO       #
 ########################################
+
+USER_AGENT="minecraft-server-script/1.0 (github.com/dominicfeliton/minecraft-server-script)"
 
 if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" ]]; then
   if [[ -z "$MINECRAFT_VERSION" ]]; then
@@ -688,20 +690,25 @@ if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" ]]; then
       echo "No version specified => using $MINECRAFT_VERSION from current_version.txt"
     else
       echo "No version specified + no current_version.txt => fetching latest from PaperMC..."
-      MINECRAFT_VERSION="$(curl -sSL "https://api.papermc.io/v2/projects/${PROJECT_NAME}" | jq -r '.versions[-1]')"
+      MINECRAFT_VERSION="$(curl -sSL -H "User-Agent: $USER_AGENT" "https://fill.papermc.io/v3/projects/${PROJECT_NAME}" | jq -r '.versions | to_entries[0].value[0]')"
     fi
   fi
 
+  echo "Fetching build info for $MINECRAFT_VERSION..."
+  BUILD_RESPONSE="$(curl -sSL -H "User-Agent: $USER_AGENT" "https://fill.papermc.io/v3/projects/${PROJECT_NAME}/versions/${MINECRAFT_VERSION}/builds")"
+
   if [[ -z "$BUILD_NUMBER" ]]; then
-    echo "No build number => fetching latest build for $MINECRAFT_VERSION..."
-    API_URL="https://api.papermc.io/v2/projects/${PROJECT_NAME}/versions/${MINECRAFT_VERSION}"
-    BUILD_NUMBER="$(curl -sSL "${API_URL}" | jq -r '.builds[-1]')"
+    echo "No build number => fetching latest stable build for $MINECRAFT_VERSION..."
+    # Get latest stable build (first in array with channel=STABLE)
+    BUILD_NUMBER="$(echo "$BUILD_RESPONSE" | jq -r '[.[] | select(.channel == "STABLE")][0].id')"
+    JAR_NAME="$(echo "$BUILD_RESPONSE" | jq -r '[.[] | select(.channel == "STABLE")][0].downloads["server:default"].name')"
+    DOWNLOAD_URL="$(echo "$BUILD_RESPONSE" | jq -r '[.[] | select(.channel == "STABLE")][0].downloads["server:default"].url')"
   else
-    API_URL="https://api.papermc.io/v2/projects/${PROJECT_NAME}/versions/${MINECRAFT_VERSION}"
+    echo "Using specified build number: $BUILD_NUMBER"
+    JAR_NAME="$(echo "$BUILD_RESPONSE" | jq -r ".[] | select(.id == ${BUILD_NUMBER}) | .downloads[\"server:default\"].name")"
+    DOWNLOAD_URL="$(echo "$BUILD_RESPONSE" | jq -r ".[] | select(.id == ${BUILD_NUMBER}) | .downloads[\"server:default\"].url")"
   fi
 
-  BUILD_API_URL="${API_URL}/builds/${BUILD_NUMBER}"
-  JAR_NAME="$(curl -sSL "${BUILD_API_URL}" | jq -r '.downloads.application.name')"
   FILE="${SERVER_DIR}/${JAR_NAME}"
 
 elif [[ "$PROJECT_NAME" == "folia" ]]; then
@@ -712,7 +719,7 @@ elif [[ "$PROJECT_NAME" == "folia" ]]; then
 elif [[ "$PROJECT_NAME" == "spigot" ]]; then
   # We'll build into spigot-server.jar
   JAR_NAME="spigot-server.jar"
-  FILE="${SPIGOT_BUILT_JAR}"  # same path
+  FILE="${SPIGOT_BUILT_JAR}"
 fi
 
 ########################################
