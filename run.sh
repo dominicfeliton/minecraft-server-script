@@ -9,6 +9,7 @@
 # 2. Config file (server.conf, .serverrc, etc.)
 # 3. These defaults (lowest priority)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Will be set by config or environment, with fallback defaults
 SERVER_DIR="${SERVER_DIR:-}"
 PROJECT_NAME="${PROJECT_NAME:-}"
@@ -31,7 +32,7 @@ AUTO_AGREE_EULA="${AUTO_AGREE_EULA:-}"
 load_config() {
   # Determine where to look for config
   # If SERVER_DIR is set, look there first
-  local search_dir="${SERVER_DIR:-$(pwd)}"
+  local search_dir="${SERVER_DIR:-$SCRIPT_DIR}"
   
   local config_files=(
     "${search_dir}/server.conf"
@@ -88,7 +89,7 @@ load_config() {
 load_config
 
 # Apply defaults for anything still unset
-: "${SERVER_DIR:=$(pwd)}"
+: "${SERVER_DIR:=$SCRIPT_DIR}"
 : "${PROJECT_NAME:=paper}"
 : "${DEFAULT_WORLD_NAME:=world}"
 : "${DEFAULT_XMS:=2G}"
