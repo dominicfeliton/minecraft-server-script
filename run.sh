@@ -24,28 +24,106 @@
 #            CONFIGURATION             #
 ########################################
 
-: "${SERVER_DIR:=/tmp/wwc_test_server}"
-TMUX_SESSION_NAME="$(basename "$SERVER_DIR")"
+# These are defaults - they can be overridden by:
+# 1. Environment variables (highest priority)
+# 2. Config file (server.conf, .serverrc, etc.)
+# 3. These defaults (lowest priority)
 
-: "${PROJECT_NAME:=paper}"  # "paper", "velocity", "folia", or "spigot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Will be set by config or environment, with fallback defaults
+SERVER_DIR="${SERVER_DIR:-}"
+PROJECT_NAME="${PROJECT_NAME:-}"
+DEFAULT_WORLD_NAME="${DEFAULT_WORLD_NAME:-}"
+DEFAULT_XMS="${DEFAULT_XMS:-}"
+DEFAULT_XMX="${DEFAULT_XMX:-}"
+JAVA_CMD="${JAVA_CMD:-}"
+PAPERMC_API_BASE="${PAPERMC_API_BASE:-}"
+PAPERMC_USER_AGENT="${PAPERMC_USER_AGENT:-}"
+SPIGOT_BUILD_DIR="${SPIGOT_BUILD_DIR:-}"
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-}"
+AUTO_AGREE_EULA="${AUTO_AGREE_EULA:-}"
 
-CURRENT_VERSION_FILE="${SERVER_DIR}/current_version.txt"
-DEFAULT_WORLD_NAME="world"
+########################################
+#          CONFIG FILE LOADING         #
+########################################
 
-DEFAULT_XMS="2G"
-DEFAULT_XMX="2G"
+load_config() {
+  # Determine where to look for config
+  # If SERVER_DIR is set, look there first
+  local search_dir="${SERVER_DIR:-$SCRIPT_DIR}"
 
-JAVA_CMD="java"  # Overridden by --java-cmd= if passed
+  local config_files=(
+    "${search_dir}/server.conf"
+    "${search_dir}/.serverrc"
+    "${HOME}/.minecraft-server.conf"
+    "/etc/minecraft-server.conf"
+  )
 
-PAPERMC_API_BASE="https://fill.papermc.io/v3"
+  local config_loaded=false
+
+  for config_file in "${config_files[@]}"; do
+    if [[ -f "$config_file" ]]; then
+      echo "Loading config from: $config_file"
+
+      while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+
+        # Remove leading/trailing whitespace
+        key="$(echo "$key" | xargs)"
+        value="$(echo "$value" | xargs)"
+
+        # Remove quotes from value if present
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+
+        # Only set if variable is currently empty
+        # This allows environment variables to take priority
+        case "$key" in
+          SERVER_DIR|PROJECT_NAME|DEFAULT_WORLD_NAME|DEFAULT_XMS|DEFAULT_XMX|\
+          JAVA_CMD|PAPERMC_API_BASE|PAPERMC_USER_AGENT|\
+          SPIGOT_BUILD_DIR|TMUX_SESSION_NAME|AUTO_AGREE_EULA)
+            if [[ -z "${!key}" ]]; then
+              declare -g "$key=$value"
+            fi
+            ;;
+        esac
+      done < "$config_file"
+
+      config_loaded=true
+      break  # Only load first config found
+    fi
+  done
+
+  if [[ "$config_loaded" == "false" ]]; then
+    echo "No config file found, using defaults/environment variables."
+  fi
+}
+
+# Load config
+load_config
+
+# Apply defaults for anything still unset
+: "${SERVER_DIR:=$SCRIPT_DIR}"
+: "${PROJECT_NAME:=paper}"
+: "${DEFAULT_WORLD_NAME:=world}"
+: "${DEFAULT_XMS:=2G}"
+: "${DEFAULT_XMX:=2G}"
+: "${JAVA_CMD:=java}"
+: "${PAPERMC_API_BASE:=https://fill.papermc.io/v3}"
 : "${PAPERMC_USER_AGENT:=minecraft-server-script/1.0 (https://github.com/dominicfeliton/minecraft-server-script)}"
+: "${AUTO_AGREE_EULA:=true}"
 
-# --- SPIGOT-RELATED CONFIG ---
-# Where we keep or download BuildTools:
-SPIGOT_BUILD_DIR="${SERVER_DIR}/buildtools"
-BUILD_TOOLS_JAR_URL="https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar"
+# Derived variables (depend on SERVER_DIR)
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-$(basename "$SERVER_DIR")}"
+CURRENT_VERSION_FILE="${SERVER_DIR}/current_version.txt"
+SPIGOT_BUILD_DIR="${SPIGOT_BUILD_DIR:-${SERVER_DIR}/buildtools}"
 BUILD_TOOLS_JAR="${SPIGOT_BUILD_DIR}/BuildTools.jar"
 SPIGOT_BUILT_JAR="${SERVER_DIR}/spigot-server.jar"
+BUILD_TOOLS_JAR_URL="https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar"
 
 ########################################
 #             USAGE & HELP             #
@@ -761,6 +839,11 @@ fi
 ########################################
 
 function ensure_eula() {
+  if [[ "$AUTO_AGREE_EULA" != "true" ]]; then
+    echo "AUTO_AGREE_EULA is not true; leaving eula.txt unchanged."
+    return
+  fi
+
   local eulaFile="${SERVER_DIR}/eula.txt"
   if [[ ! -f "$eulaFile" ]]; then
     echo "eula.txt not found; creating it with eula=true"
