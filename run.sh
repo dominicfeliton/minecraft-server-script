@@ -42,6 +42,7 @@ PAPERMC_USER_AGENT="${PAPERMC_USER_AGENT:-}"
 SPIGOT_BUILD_DIR="${SPIGOT_BUILD_DIR:-}"
 TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-}"
 AUTO_AGREE_EULA="${AUTO_AGREE_EULA:-}"
+CHECK_TAILSCALE_BIND="${CHECK_TAILSCALE_BIND:-}"
 
 ########################################
 #          CONFIG FILE LOADING         #
@@ -85,7 +86,7 @@ load_config() {
         case "$key" in
           SERVER_DIR|PROJECT_NAME|DEFAULT_WORLD_NAME|DEFAULT_XMS|DEFAULT_XMX|\
           JAVA_CMD|PAPERMC_API_BASE|PAPERMC_USER_AGENT|\
-          SPIGOT_BUILD_DIR|TMUX_SESSION_NAME|AUTO_AGREE_EULA)
+          SPIGOT_BUILD_DIR|TMUX_SESSION_NAME|AUTO_AGREE_EULA|CHECK_TAILSCALE_BIND)
             if [[ -z "${!key}" ]]; then
               declare -g "$key=$value"
             fi
@@ -116,6 +117,7 @@ load_config
 : "${PAPERMC_API_BASE:=https://fill.papermc.io/v3}"
 : "${PAPERMC_USER_AGENT:=minecraft-server-script/1.0 (https://github.com/dominicfeliton/minecraft-server-script)}"
 : "${AUTO_AGREE_EULA:=true}"
+: "${CHECK_TAILSCALE_BIND:=true}"
 
 # Derived variables (depend on SERVER_DIR)
 TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-$(basename "$SERVER_DIR")}"
@@ -132,7 +134,7 @@ BUILD_TOOLS_JAR_URL="https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccess
 usage() {
     cat << EOF
 Usage:
-  $(basename "$0") <subcommand> [arguments...]
+  $(basename "$0") [subcommand] [arguments...]
 
 Subcommands:
   start    [mc_version] [build_number] [--no-update] [--xms=###] [--xmx=###] [--java-cmd=...] [--no-tmux]
@@ -140,7 +142,7 @@ Subcommands:
   restart  [mc_version] [build_number] ...
   toggle
 
-If no subcommand is provided, 'toggle' is used.
+If no subcommand is provided, or the first argument is an option, 'toggle' is used.
 
 Environment variable:
   PROJECT_NAME=paper (default), velocity, folia, or spigot
@@ -173,19 +175,96 @@ if [[ ! -d "${SERVER_DIR}" ]]; then
 fi
 
 ########################################
+#            GENERAL HELPERS           #
+########################################
+
+function trim_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+function read_server_property() {
+  local key="$1"
+  local properties_file="${SERVER_DIR}/server.properties"
+  local line
+
+  [[ -f "$properties_file" ]] || return 1
+  line="$(grep -m1 -E "^[[:space:]]*${key}[[:space:]]*=" "$properties_file" 2>/dev/null)" || return 1
+  trim_value "${line#*=}"
+}
+
+function is_tailscale_ipv4() {
+  local ip="$1"
+  local a
+  local b
+  local c
+  local d
+
+  IFS='.' read -r a b c d <<< "$ip"
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$a == 100 && 10#$b >= 64 && 10#$b <= 127 && 10#$c >= 0 && 10#$c <= 255 && 10#$d >= 0 && 10#$d <= 255 ))
+}
+
+function tailscale_bind_preflight() {
+  local server_ip
+  local server_port
+  local tailscale_ips
+  local displayed_tailscale_ips
+
+  [[ "$CHECK_TAILSCALE_BIND" == "true" ]] || return 0
+
+  server_ip="$(read_server_property "server-ip" || true)"
+  server_ip="$(trim_value "$server_ip")"
+  [[ -n "$server_ip" ]] || return 0
+  is_tailscale_ipv4 "$server_ip" || return 0
+
+  server_port="$(read_server_property "server-port" || true)"
+  server_port="$(trim_value "$server_port")"
+  [[ -n "$server_port" ]] || server_port="25565"
+
+  if ! command -v tailscale &>/dev/null; then
+    echo "Error: server.properties binds to Tailscale IP ${server_ip}:${server_port}, but the tailscale command was not found." >&2
+    echo "Fix: install Tailscale, clear server-ip= in server.properties, or set server-ip to an address assigned to this host." >&2
+    exit 1
+  fi
+
+  tailscale_ips="$(tailscale ip -4 2>&1 || true)"
+  displayed_tailscale_ips="$(trim_value "$tailscale_ips")"
+  [[ -n "$displayed_tailscale_ips" ]] || displayed_tailscale_ips="(none)"
+
+  if ! grep -Fxq "$server_ip" <<< "$tailscale_ips"; then
+    echo "Error: server.properties binds to Tailscale IP ${server_ip}:${server_port}, but this host does not currently have that Tailscale IPv4." >&2
+    echo "tailscale ip -4 returned:" >&2
+    echo "$displayed_tailscale_ips" >&2
+    echo >&2
+    echo "Suggested fixes:" >&2
+    echo "  sudo tailscale up" >&2
+    echo "  sed -i 's/^server-ip=.*/server-ip=/' ${SERVER_DIR}/server.properties" >&2
+    echo "  or update server-ip to the current value from: tailscale ip -4" >&2
+    exit 1
+  fi
+
+  echo "Tailscale bind OK: ${server_ip}:${server_port}"
+}
+
+########################################
 #           SUBCOMMAND LOGIC           #
 ########################################
 
-SUBCOMMAND="$1"
-[[ -z "$SUBCOMMAND" ]] && SUBCOMMAND="toggle"
+SUBCOMMAND="${1:-toggle}"
 
 case "$SUBCOMMAND" in
   start|stop|restart|toggle)
-    shift
+    [[ $# -gt 0 ]] && shift
     ;;
   help|--help|-h)
     usage
     exit 0
+    ;;
+  -*)
+    SUBCOMMAND="toggle"
     ;;
   *)
     usage
@@ -214,6 +293,9 @@ USER_SUPPLIED_MINECRAFT_VERSION=false
 AUTO_DETECTED_PAPERMC_UPGRADE=false
 DOWNLOAD_PERFORMED=false
 PAPERMC_SELECTED_CHANNEL=""
+PAPERMC_DECLINED_STABLE_TARGET=""
+PAPERMC_DECLINED_ALPHA_TARGET=""
+PAPERMC_PROMPT_RESULT=""
 XMS="${DEFAULT_XMS}"
 XMX="${DEFAULT_XMX}"
 
@@ -305,6 +387,8 @@ fi
 ########################################
 #        START SUBCOMMAND LOGIC        #
 ########################################
+
+tailscale_bind_preflight
 
 ########################################
 #            DETECT JAVA VER           #
@@ -558,13 +642,6 @@ function valid_api_value() {
   [[ -n "$1" && "$1" != "null" ]]
 }
 
-function trim_value() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s\n' "$value"
-}
-
 function read_current_version_value() {
   local line
 
@@ -584,6 +661,8 @@ function read_papermc_state() {
   PAPERMC_STATE_VERSION=""
   PAPERMC_STATE_BUILD=""
   PAPERMC_STATE_CHANNEL=""
+  PAPERMC_STATE_DECLINED_STABLE_TARGET=""
+  PAPERMC_STATE_DECLINED_ALPHA_TARGET=""
   PAPERMC_STATE_FORMAT=""
 
   [[ -f "$CURRENT_VERSION_FILE" ]] || return 1
@@ -603,6 +682,12 @@ function read_papermc_state() {
           ;;
         CHANNEL)
           PAPERMC_STATE_CHANNEL="$value"
+          ;;
+        DECLINED_STABLE_TARGET)
+          PAPERMC_STATE_DECLINED_STABLE_TARGET="$value"
+          ;;
+        DECLINED_ALPHA_TARGET)
+          PAPERMC_STATE_DECLINED_ALPHA_TARGET="$value"
           ;;
       esac
     done < "$CURRENT_VERSION_FILE"
@@ -625,6 +710,8 @@ function write_papermc_state() {
     printf 'VERSION=%s\n' "$MINECRAFT_VERSION"
     printf 'BUILD=%s\n' "$BUILD_NUMBER"
     printf 'CHANNEL=%s\n' "$PAPERMC_SELECTED_CHANNEL"
+    printf 'DECLINED_STABLE_TARGET=%s\n' "$PAPERMC_DECLINED_STABLE_TARGET"
+    printf 'DECLINED_ALPHA_TARGET=%s\n' "$PAPERMC_DECLINED_ALPHA_TARGET"
   } > "$CURRENT_VERSION_FILE"
 }
 
@@ -771,6 +858,7 @@ function prompt_papermc_choice() {
   local question="$5"
   local confirm
 
+  PAPERMC_PROMPT_RESULT="unshown"
   [[ -t 0 ]] || return 1
 
   echo "----------------------------------------"
@@ -783,7 +871,68 @@ function prompt_papermc_choice() {
   echo "No world folders or server files will be removed for this auto-detected change."
   echo "$question"
   read -r confirm
-  [[ "$confirm" =~ ^[yY]$ ]]
+  if [[ "$confirm" =~ ^[yY]$ ]]; then
+    PAPERMC_PROMPT_RESULT="accepted"
+    return 0
+  fi
+
+  PAPERMC_PROMPT_RESULT="declined"
+  return 1
+}
+
+function papermc_target_key() {
+  local version="$1"
+  local build="$2"
+  local channel="$3"
+
+  printf '%s:%s:%s\n' "$version" "$build" "$channel"
+}
+
+function papermc_declined_target_matches() {
+  local channel="$1"
+  local target="$2"
+
+  case "$channel" in
+    ALPHA)
+      [[ "$PAPERMC_DECLINED_ALPHA_TARGET" == "$target" ]]
+      ;;
+    STABLE)
+      [[ "$PAPERMC_DECLINED_STABLE_TARGET" == "$target" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+function record_papermc_declined_target() {
+  local channel="$1"
+  local target="$2"
+
+  case "$channel" in
+    ALPHA)
+      PAPERMC_DECLINED_ALPHA_TARGET="$target"
+      ;;
+    STABLE)
+      PAPERMC_DECLINED_STABLE_TARGET="$target"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+function clear_papermc_declined_target() {
+  local channel="$1"
+
+  case "$channel" in
+    ALPHA)
+      PAPERMC_DECLINED_ALPHA_TARGET=""
+      ;;
+    STABLE)
+      PAPERMC_DECLINED_STABLE_TARGET=""
+      ;;
+  esac
 }
 
 function apply_resolved_papermc_build() {
@@ -965,6 +1114,7 @@ function resolve_papermc_download_info() {
   local saved_track=""
   local current_label
   local target_label
+  local target_key
 
   load_papermc_project_versions || die "No ${PROJECT_NAME} versions could be resolved from PaperMC."
 
@@ -989,6 +1139,8 @@ function resolve_papermc_download_info() {
   saved_version="$PAPERMC_STATE_VERSION"
   saved_build="$PAPERMC_STATE_BUILD"
   saved_channel="$PAPERMC_STATE_CHANNEL"
+  PAPERMC_DECLINED_STABLE_TARGET="$PAPERMC_STATE_DECLINED_STABLE_TARGET"
+  PAPERMC_DECLINED_ALPHA_TARGET="$PAPERMC_STATE_DECLINED_ALPHA_TARGET"
   echo "No version specified => using $saved_version from current_version.txt"
   if valid_api_value "$saved_build" || valid_api_value "$saved_channel"; then
     echo "Saved PaperMC state: version=${saved_version}, build=${saved_build:-unknown}, channel=${saved_channel:-unknown}"
@@ -1002,10 +1154,16 @@ function resolve_papermc_download_info() {
     if valid_api_value "$latest_alpha_version" && papermc_version_is_newer "$latest_alpha_version" "$current_version"; then
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
       target_label="$(format_papermc_build_label "$latest_alpha_version" "$latest_alpha_build" "$latest_alpha_channel")"
-      if prompt_papermc_choice "A newer experimental ${PROJECT_NAME} version is available." "$current_label" "$target_label" "This stays on the ALPHA track and updates to a newer experimental Minecraft/Paper version." "Switch to this newer ALPHA jar? [y/N]"; then
+      target_key="$(papermc_target_key "$latest_alpha_version" "$latest_alpha_build" "$latest_alpha_channel")"
+      if papermc_declined_target_matches "$latest_alpha_channel" "$target_key"; then
+        echo "Skipping previously declined ${latest_alpha_channel} target: ${target_label}"
+      elif prompt_papermc_choice "A newer experimental ${PROJECT_NAME} version is available." "$current_label" "$target_label" "This stays on the ALPHA track and updates to a newer experimental Minecraft/Paper version." "Switch to this newer ALPHA jar? [y/N]"; then
+        clear_papermc_declined_target "$latest_alpha_channel"
         set_papermc_target "$latest_alpha_version" "$latest_alpha_build" "$latest_alpha_channel" "$latest_alpha_jar_name" "$latest_alpha_download_url"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
         return 0
+      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+        record_papermc_declined_target "$latest_alpha_channel" "$target_key"
       fi
     fi
   fi
@@ -1015,18 +1173,30 @@ function resolve_papermc_download_info() {
       capture_resolved_same_version_stable
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
       target_label="$(format_papermc_build_label "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel")"
-      if prompt_papermc_choice "The saved ${PROJECT_NAME} version now has a STABLE build." "$current_label" "$target_label" "This keeps the same Minecraft/Paper version and switches from ALPHA to STABLE." "Switch this version to STABLE? [y/N]"; then
+      target_key="$(papermc_target_key "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel")"
+      if papermc_declined_target_matches "$same_version_stable_channel" "$target_key"; then
+        echo "Skipping previously declined ${same_version_stable_channel} target: ${target_label}"
+      elif prompt_papermc_choice "The saved ${PROJECT_NAME} version now has a STABLE build." "$current_label" "$target_label" "This keeps the same Minecraft/Paper version and switches from ALPHA to STABLE." "Switch this version to STABLE? [y/N]"; then
+        clear_papermc_declined_target "$same_version_stable_channel"
         set_papermc_target "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel" "$same_version_stable_jar_name" "$same_version_stable_download_url"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
         return 0
+      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+        record_papermc_declined_target "$same_version_stable_channel" "$target_key"
       fi
     elif valid_api_value "$latest_stable_version"; then
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
       target_label="$(format_papermc_build_label "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
-      if prompt_papermc_choice "The saved ${PROJECT_NAME} version is still experimental; the latest stable release is different." "$current_label" "$target_label" "This switches from the ALPHA track to the latest STABLE PaperMC download." "Switch to the latest stable jar? [y/N]"; then
+      target_key="$(papermc_target_key "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
+      if papermc_declined_target_matches "$latest_stable_channel" "$target_key"; then
+        echo "Skipping previously declined ${latest_stable_channel} target: ${target_label}"
+      elif prompt_papermc_choice "The saved ${PROJECT_NAME} version is still experimental; the latest stable release is different." "$current_label" "$target_label" "This switches from the ALPHA track to the latest STABLE PaperMC download." "Switch to the latest stable jar? [y/N]"; then
+        clear_papermc_declined_target "$latest_stable_channel"
         set_papermc_target "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel" "$latest_stable_jar_name" "$latest_stable_download_url"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
         return 0
+      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+        record_papermc_declined_target "$latest_stable_channel" "$target_key"
       fi
     fi
   fi
@@ -1035,10 +1205,16 @@ function resolve_papermc_download_info() {
     if valid_api_value "$latest_stable_version" && [[ "$latest_stable_version" != "$current_version" || "$latest_stable_build" != "$current_build" ]]; then
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
       target_label="$(format_papermc_build_label "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
-      if prompt_papermc_choice "A newer stable ${PROJECT_NAME} download is available." "$current_label" "$target_label" "This performs a drop-in jar update on the STABLE track." "Continue with this stable jar update? [y/N]"; then
+      target_key="$(papermc_target_key "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
+      if papermc_declined_target_matches "$latest_stable_channel" "$target_key"; then
+        echo "Skipping previously declined ${latest_stable_channel} target: ${target_label}"
+      elif prompt_papermc_choice "A newer stable ${PROJECT_NAME} download is available." "$current_label" "$target_label" "This performs a drop-in jar update on the STABLE track." "Continue with this stable jar update? [y/N]"; then
+        clear_papermc_declined_target "$latest_stable_channel"
         set_papermc_target "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel" "$latest_stable_jar_name" "$latest_stable_download_url"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
         return 0
+      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+        record_papermc_declined_target "$latest_stable_channel" "$target_key"
       fi
     fi
   fi
@@ -1140,8 +1316,9 @@ elif is_papermc_project; then
   download_jar
   if [[ "$DOWNLOAD_PERFORMED" == "true" ]]; then
     remove_old_jars
-    write_papermc_state
   fi
+  [[ -s "$FILE" ]] || die "Server jar is missing or empty: ${FILE:-unset}"
+  write_papermc_state
 fi
 
 if [[ -z "$FILE" || "$FILE" == */null || ! -s "$FILE" ]]; then
@@ -1174,6 +1351,7 @@ echo "JAVA_CMD             = ${JAVA_CMD}"
 echo "JAVA_MAJOR_VERSION   = ${JAVA_MAJOR_VERSION}"
 echo "USE_TMUX             = ${USE_TMUX}"
 echo "TMUX_SESSION_NAME    = ${TMUX_SESSION_NAME}"
+echo "CHECK_TAILSCALE_BIND = ${CHECK_TAILSCALE_BIND}"
 echo "----------------------------------------"
 
 echo "Starting ${PROJECT_NAME} server..."
