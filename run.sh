@@ -586,6 +586,7 @@ function resolve_papermc_build() {
   local project="$1"
   local mc_version="$2"
   local requested_build="$3"
+  local channel_filter="${4:-STABLE}"
   local builds_url="${PAPERMC_API_BASE}/projects/${project}/versions/${mc_version}/builds"
   local builds_json
   local build_json
@@ -599,8 +600,10 @@ function resolve_papermc_build() {
 
   if [[ -n "$requested_build" ]]; then
     build_json="$(jq -c --arg build "$requested_build" 'first(.[] | select(((.id // .number) | tostring) == $build)) // empty' <<< "$builds_json")"
+  elif [[ "$channel_filter" == "ANY" ]]; then
+    build_json="$(jq -c '[.[]] | max_by((.id // .number) | tonumber? // 0) // empty' <<< "$builds_json")"
   else
-    build_json="$(jq -c 'first(.[] | select(.channel == "STABLE")) // empty' <<< "$builds_json")"
+    build_json="$(jq -c --arg channel "$channel_filter" '[.[] | select(.channel == $channel)] | max_by((.id // .number) | tonumber? // 0) // empty' <<< "$builds_json")"
   fi
 
   valid_api_value "$build_json" || return 1
@@ -649,19 +652,41 @@ function prompt_for_papermc_upgrade() {
   local latest_version="$3"
   local latest_build="$4"
   local reason="$5"
+  local prompt_kind="${6:-update}"
+  local current_channel="$7"
+  local latest_channel="${8:-STABLE}"
   local confirm
+  local current_label
+  local latest_label
 
   [[ -t 0 ]] || return 1
 
+  current_label="${current_version:-unknown} build ${current_build:-unknown}"
+  latest_label="${latest_version:-unknown} build ${latest_build:-unknown}"
+  if valid_api_value "$current_channel"; then
+    current_label="${current_label} (${current_channel})"
+  fi
+  if valid_api_value "$latest_channel"; then
+    latest_label="${latest_label} (${latest_channel})"
+  fi
+
   echo "----------------------------------------"
   echo "${reason}"
-  echo "Current ${PROJECT_NAME}: ${current_version:-unknown} build ${current_build:-unknown}"
-  echo "Latest stable ${PROJECT_NAME}: ${latest_version} build ${latest_build}"
+  echo "Saved ${PROJECT_NAME}: ${current_label}"
+  echo "Latest stable ${PROJECT_NAME}: ${latest_label}"
   echo
-  echo "This will perform a drop-in jar update only."
+  if [[ "$prompt_kind" == "switch-to-stable" ]]; then
+    echo "This will switch the saved ${PROJECT_NAME} selection to the latest STABLE PaperMC download."
+  else
+    echo "This will perform a drop-in jar update only."
+  fi
   echo "Before accepting, make sure you have backed up your worlds and followed the proper Minecraft/Paper upgrade path."
-  echo "No world folders or server files will be removed for this auto-detected upgrade."
-  echo "Continue with this jar-only update? [y/N]"
+  echo "No world folders or server files will be removed for this auto-detected change."
+  if [[ "$prompt_kind" == "switch-to-stable" ]]; then
+    echo "Switch to the latest stable jar? [y/N]"
+  else
+    echo "Continue with this jar-only update? [y/N]"
+  fi
   read -r confirm
   [[ "$confirm" =~ ^[yY]$ ]]
 }
@@ -694,10 +719,13 @@ function resolve_papermc_download_info() {
   local current_build=""
   local current_jar_name=""
   local current_download_url=""
+  local current_available_build=""
+  local current_available_channel=""
   local latest_version=""
   local latest_build=""
   local latest_jar_name=""
   local latest_download_url=""
+  local reason=""
 
   if [[ -z "$MINECRAFT_VERSION" ]]; then
     if [[ -f "$CURRENT_VERSION_FILE" ]]; then
@@ -751,7 +779,18 @@ function resolve_papermc_download_info() {
   fi
 
   if [[ "$current_valid" == "false" ]]; then
-    if prompt_for_papermc_upgrade "$MINECRAFT_VERSION" "$BUILD_NUMBER" "$latest_version" "$latest_build" "No stable ${PROJECT_NAME} download was found for the saved version."; then
+    if resolve_papermc_build "$PROJECT_NAME" "$MINECRAFT_VERSION" "$BUILD_NUMBER" "ANY"; then
+      current_available_build="$RESOLVED_BUILD"
+      current_available_channel="$RESOLVED_CHANNEL"
+    fi
+
+    if valid_api_value "$current_available_build"; then
+      reason="Saved ${PROJECT_NAME} version ${MINECRAFT_VERSION} has no STABLE build. The latest available build for that saved version is ${current_available_build} (${current_available_channel:-unknown channel})."
+    else
+      reason="No PaperMC download was found for the saved ${PROJECT_NAME} version."
+    fi
+
+    if prompt_for_papermc_upgrade "$MINECRAFT_VERSION" "${current_available_build:-$BUILD_NUMBER}" "$latest_version" "$latest_build" "$reason" "switch-to-stable" "$current_available_channel" "STABLE"; then
       MINECRAFT_VERSION="$latest_version"
       BUILD_NUMBER="$latest_build"
       JAR_NAME="$latest_jar_name"
@@ -764,7 +803,7 @@ function resolve_papermc_download_info() {
   fi
 
   if [[ "$AUTO_UPDATE" == "true" && "$selected_from_current_file" == "true" && ( "$current_version" != "$latest_version" || "$current_build" != "$latest_build" ) ]]; then
-    if prompt_for_papermc_upgrade "$current_version" "$current_build" "$latest_version" "$latest_build" "A newer stable ${PROJECT_NAME} download is available."; then
+    if prompt_for_papermc_upgrade "$current_version" "$current_build" "$latest_version" "$latest_build" "A newer stable ${PROJECT_NAME} download is available." "update" "$RESOLVED_CHANNEL" "STABLE"; then
       MINECRAFT_VERSION="$latest_version"
       BUILD_NUMBER="$latest_build"
       JAR_NAME="$latest_jar_name"
