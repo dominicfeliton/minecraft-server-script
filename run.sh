@@ -11,8 +11,7 @@
 #   PROJECT_NAME : "paper" (default), "velocity", "folia", or "spigot"
 #
 # Key features:
-#  - Folia: checks a local Git repo for upstream changes and builds in Docker (OpenJDK 22).
-#  - Paper/Velocity: fetch builds from PaperMC's API.
+#  - Paper/Velocity/Folia: fetch builds from PaperMC's Fill API.
 #  - Spigot: downloads BuildTools and compiles the requested MC version.
 #  - Backup & clean the old world folders when version changes (Paper/Folia/Spigot).
 #  - **Auto-agree to the EULA** (no manual editing).
@@ -38,14 +37,8 @@ DEFAULT_XMX="2G"
 
 JAVA_CMD="java"  # Overridden by --java-cmd= if passed
 
-# --- FOLIA-RELATED CONFIG ---
-: "${FOLIA_SRC_DIR:=/home/minecraft/FoliaSource}"   # local Git clone
-FOLIA_GIT_URL="https://github.com/PaperMC/Folia.git"
-#FOLIA_BRANCH="master"    # or "main", etc.
-FOLIA_BRANCH="dev/hard-fork"
-
-# Docker build context directory
-: "${FOLIA_DOCKER_CTX=/home/minecraft/folia_docker_build}"
+PAPERMC_API_BASE="https://fill.papermc.io/v3"
+: "${PAPERMC_USER_AGENT:=minecraft-server-script/1.0 (https://github.com/dominicfeliton/minecraft-server-script)}"
 
 # --- SPIGOT-RELATED CONFIG ---
 # Where we keep or download BuildTools:
@@ -80,16 +73,16 @@ EOF
 #       DEPENDENCY & ENV CHECKS        #
 ########################################
 
-# For Paper/Velocity/Spigot => we need curl & jq
-if [[ "$PROJECT_NAME" != "folia" ]]; then
+# For Paper/Velocity/Folia/Spigot => we need curl; PaperMC projects also need jq
+if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" || "$PROJECT_NAME" == "folia" || "$PROJECT_NAME" == "spigot" ]]; then
   if ! command -v curl &>/dev/null; then
     echo "Error: 'curl' is required. Install it with your package manager first."
     exit 1
   fi
   if [[ "$PROJECT_NAME" != "spigot" ]]; then
-    # spigot doesn't absolutely require jq for build, but Paper/Velocity do
+    # Spigot doesn't absolutely require jq for build, but PaperMC projects do.
     if ! command -v jq &>/dev/null; then
-      echo "Error: 'jq' is required for Paper/Velocity. Install it with your package manager first."
+      echo "Error: 'jq' is required for Paper/Velocity/Folia. Install it with your package manager first."
       exit 1
     fi
   fi
@@ -139,6 +132,9 @@ fi
 AUTO_UPDATE=true
 MINECRAFT_VERSION=""
 BUILD_NUMBER=""
+USER_SUPPLIED_MINECRAFT_VERSION=false
+AUTO_DETECTED_PAPERMC_UPGRADE=false
+DOWNLOAD_PERFORMED=false
 XMS="${DEFAULT_XMS}"
 XMX="${DEFAULT_XMX}"
 
@@ -165,8 +161,11 @@ while [[ $i -lt $# ]]; do
       echo "Warning: Unrecognized option '${args[$i]}'"
       ;;
     *)
-      if [[ -z "$MINECRAFT_VERSION" ]]; then
+      if [[ -z "${args[$i]}" ]]; then
+        :
+      elif [[ -z "$MINECRAFT_VERSION" ]]; then
         MINECRAFT_VERSION="${args[$i]}"
+        USER_SUPPLIED_MINECRAFT_VERSION=true
       elif [[ -z "$BUILD_NUMBER" ]]; then
         BUILD_NUMBER="${args[$i]}"
       fi
@@ -322,197 +321,6 @@ function is_wsl() {
 }
 
 ########################################
-#   DOCKER-BASED FOLIA BUILD (JDK 22)  #
-########################################
-
-function docker_build_folia_if_needed() {
-  echo "=== Checking for Folia updates in local repo ==="
-
-  # 1) Check Docker
-  if ! command -v docker &>/dev/null; then
-    echo "Error: Docker not installed. Exiting."
-    exit 1
-  fi
-  if ! docker info &>/dev/null; then
-    echo "Error: Current user cannot run docker (missing perms?). Exiting."
-    exit 1
-  fi
-
-  # 2) Ensure local git clone
-  if [[ ! -d "$FOLIA_SRC_DIR/.git" ]]; then
-    echo "[Folia] Cloning repo into $FOLIA_SRC_DIR ..."
-    git clone --branch "$FOLIA_BRANCH" "$FOLIA_GIT_URL" "$FOLIA_SRC_DIR"
-    [[ $? -ne 0 ]] && { echo "Error: git clone failed."; exit 1; }
-  fi
-
-  # 3) Fetch remote changes
-  echo "[Folia] Fetching remote..."
-  pushd "$FOLIA_SRC_DIR" >/dev/null || exit 1
-  git fetch origin
-  [[ $? -ne 0 ]] && { echo "Error: git fetch failed."; exit 1; }
-
-  local LOCAL_HASH
-  LOCAL_HASH="$(git rev-parse HEAD)"
-  local REMOTE_HASH
-  REMOTE_HASH="$(git rev-parse origin/$FOLIA_BRANCH)"
-  echo "[Folia] Local HEAD:  $LOCAL_HASH"
-  echo "[Folia] Remote HEAD: $REMOTE_HASH"
-
-  popd >/dev/null || exit 1
-
-  # 4) If --no-update => skip pulling. If jar missing, force build
-  if [[ "$AUTO_UPDATE" == "false" ]]; then
-    echo "[Folia] Auto-update OFF, not pulling changes..."
-    if [[ ! -f "${SERVER_DIR}/folia-server.jar" ]]; then
-      echo "[Folia] No folia-server.jar => forced Docker build..."
-      docker_build_folia
-    else
-      echo "[Folia] Using existing jar. No build."
-    fi
-    return 0
-  fi
-
-  # 5) If there's a difference, pull + build. If jar missing, build anyway
-  if [[ "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
-    echo "[Folia] Upstream changes detected. Pulling + building..."
-    pushd "$FOLIA_SRC_DIR" >/dev/null || exit 1
-    git pull --rebase origin "$FOLIA_BRANCH"
-    [[ $? -ne 0 ]] && { echo "Error: git pull failed."; exit 1; }
-    popd >/dev/null || exit 1
-
-    docker_build_folia
-  else
-    echo "[Folia] No remote changes (HEAD is up-to-date)."
-    if [[ ! -f "${SERVER_DIR}/folia-server.jar" ]]; then
-      echo "[Folia] jar missing => forced Docker build..."
-      docker_build_folia
-    else
-      echo "[Folia] jar is present => no build needed."
-    fi
-  fi
-}
-
-function docker_build_folia() {
-  echo "=== Building Folia in Docker (OpenJDK 22) ==="
-
-  mkdir -p "$FOLIA_DOCKER_CTX"
-
-  # 1) Sync Folia source to build context:
-  rsync -av --delete "$FOLIA_SRC_DIR/" "$FOLIA_DOCKER_CTX/"
-
-  # 2) Create Dockerfile (AFTER rsync, so it won't get overwritten)
-  cat > "$FOLIA_DOCKER_CTX/Dockerfile" << 'EOF'
-FROM amazoncorretto:21
-
-# Install missing tools using yum
-RUN yum update -y && yum install -y git findutils
-
-RUN git config --global user.name "Test User"
-RUN git config --global user.email "testemail@test.com"
-
-WORKDIR /FoliaSource
-COPY . /FoliaSource
-
-# Build Folia - note that we're using applyAllPatches instead of just applyPatches
-RUN ./gradlew applyAllPatches && ./gradlew createMojmapBundlerJar
-EOF
-
-  # 3) Build the Docker image
-  echo "[Folia] docker build => local-folia:latest"
-  docker build -t local-folia:latest "$FOLIA_DOCKER_CTX"
-  if [[ $? -ne 0 ]]; then
-    echo "Error: Docker build failed. Exiting."
-    exit 1
-  fi
-
-  # 4) Create container so we can docker cp
-  echo "[Folia] Creating temporary container to extract files..."
-  docker create --name tempfolia local-folia:latest
-  if [[ $? -ne 0 ]]; then
-    echo "Error: docker create failed. Exiting."
-    exit 1
-  fi
-
-  # 5) Create a temporary directory for copying files
-  local temp_output_dir="${SERVER_DIR}/build-output"
-  mkdir -p "$temp_output_dir"
-  
-  # 6) Copy out build directories that might contain our jar files
-  echo "[Folia] Copying potential jar locations from container..."
-  
-  # Try common locations where jar files might be found
-  declare -a jar_locations=(
-    "/FoliaSource/build/libs"
-    "/FoliaSource/folia-server/build/libs" 
-    "/FoliaSource/server/build/libs"
-    "/FoliaSource/paper-server/build/libs"
-  )
-  
-  # Loop through locations and try to copy each one
-  for location in "${jar_locations[@]}"; do
-    echo "[Folia] Trying to copy from: $location"
-    docker cp "tempfolia:$location" "$temp_output_dir/" 2>/dev/null || true
-  done
-  
-  # 7) Find the most appropriate jar to use as server jar
-  echo "[Folia] Searching for jar files in extracted directories..."
-  local BUILT_JAR=""
-  
-  # First priority: bundler jars with mojmap in the name
-  BUILT_JAR="$(find "$temp_output_dir" -type f -name '*bundler*mojmap*.jar' | sort -r | head -n1)"
-  
-  # Second priority: any mojmap jar
-  if [[ -z "$BUILT_JAR" ]]; then
-    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*mojmap*.jar' | sort -r | head -n1)"
-  fi
-  
-  # Third priority: any bundler jar
-  if [[ -z "$BUILT_JAR" ]]; then
-    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*bundler*.jar' | sort -r | head -n1)"
-  fi
-  
-  # Fourth priority: any jar file with folia in the name
-  if [[ -z "$BUILT_JAR" ]]; then
-    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*folia*.jar' | sort -r | head -n1)"
-  fi
-  
-  # Last resort: any jar file
-  if [[ -z "$BUILT_JAR" ]]; then
-    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*.jar' | sort -r | head -n1)"
-  fi
-  
-  if [[ -z "$BUILT_JAR" ]]; then
-    echo "Error: No JAR found in extracted directories. Let's try one more method..."
-    
-    # Try a direct command to list all jar files in the container and copy them one by one
-    docker run --rm -v "$temp_output_dir:/output" local-folia:latest \
-      sh -c "find /FoliaSource -name '*.jar' -exec cp {} /output/ \;"
-    
-    # Look for jars again
-    BUILT_JAR="$(find "$temp_output_dir" -type f -name '*bundler*mojmap*.jar' | sort -r | head -n1)"
-    if [[ -z "$BUILT_JAR" ]]; then
-      BUILT_JAR="$(find "$temp_output_dir" -type f -name '*.jar' | sort -r | head -n1)"
-    fi
-    
-    if [[ -z "$BUILT_JAR" ]]; then
-      echo "Error: Still no JAR found. Unable to proceed."
-      docker rm tempfolia >/dev/null 2>&1
-      exit 1
-    fi
-  fi
-  
-  echo "[Folia] Using jar: $(basename "$BUILT_JAR")"
-  cp "$BUILT_JAR" "${SERVER_DIR}/folia-server.jar"
-  
-  # 8) Cleanup
-  echo "[Folia] Cleaning up temporary files and container..."
-  rm -rf "$temp_output_dir"
-  docker rm tempfolia >/dev/null 2>&1
-
-  echo "=== Done. Built Folia (folia-server.jar) is in ${SERVER_DIR} ==="
-}
-
-########################################
 #        SPIGOT BUILD (BuildTools)     #
 ########################################
 
@@ -633,6 +441,11 @@ backup_and_clean() {
 maybe_backup_and_clean() {
   # Paper, Folia, or Spigot do backups on version change
   if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "folia" || "$PROJECT_NAME" == "spigot" ]]; then
+    if [[ "$AUTO_DETECTED_PAPERMC_UPGRADE" == "true" ]]; then
+      echo "Auto-detected PaperMC upgrade accepted => jar-only update; skipping backup/clean."
+      echo "Back up worlds and follow the proper upgrade path before running upgraded Minecraft versions in production."
+      return
+    fi
     if [[ -f "$CURRENT_VERSION_FILE" ]]; then
       local last_ver
       last_ver="$(< "$CURRENT_VERSION_FILE")"
@@ -650,12 +463,250 @@ maybe_backup_and_clean() {
 }
 
 ########################################
-#   PAPER/VELOCITY DOWNLOAD LOGIC      #
+#   PAPERMC DOWNLOAD RESOLUTION        #
 ########################################
 
+function die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+function is_papermc_project() {
+  [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" || "$PROJECT_NAME" == "folia" ]]
+}
+
+function valid_api_value() {
+  [[ -n "$1" && "$1" != "null" ]]
+}
+
+function papermc_fetch_json() {
+  local url="$1"
+  local description="$2"
+  local response
+
+  if ! response="$(curl -fsSL -H "User-Agent: ${PAPERMC_USER_AGENT}" "$url")"; then
+    echo "Error: failed to fetch ${description} from ${url}" >&2
+    return 1
+  fi
+
+  if ! jq -e . >/dev/null 2>&1 <<< "$response"; then
+    echo "Error: invalid JSON while fetching ${description} from ${url}" >&2
+    return 1
+  fi
+
+  if jq -e '.ok == false' >/dev/null 2>&1 <<< "$response"; then
+    local message
+    message="$(jq -r '.message // "unknown PaperMC API error"' <<< "$response")"
+    echo "Error: PaperMC API rejected ${description}: ${message}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$response"
+}
+
+function resolve_papermc_build() {
+  local project="$1"
+  local mc_version="$2"
+  local requested_build="$3"
+  local builds_url="${PAPERMC_API_BASE}/projects/${project}/versions/${mc_version}/builds"
+  local builds_json
+  local build_json
+
+  valid_api_value "$project" || return 1
+  valid_api_value "$mc_version" || return 1
+
+  if ! builds_json="$(papermc_fetch_json "$builds_url" "builds for ${project} ${mc_version}")"; then
+    return 1
+  fi
+
+  if [[ -n "$requested_build" ]]; then
+    build_json="$(jq -c --arg build "$requested_build" 'first(.[] | select(((.id // .number) | tostring) == $build)) // empty' <<< "$builds_json")"
+  else
+    build_json="$(jq -c 'first(.[] | select(.channel == "STABLE")) // empty' <<< "$builds_json")"
+  fi
+
+  valid_api_value "$build_json" || return 1
+
+  RESOLVED_VERSION="$mc_version"
+  RESOLVED_BUILD="$(jq -r '(.id // .number // empty)' <<< "$build_json")"
+  RESOLVED_CHANNEL="$(jq -r '(.channel // empty)' <<< "$build_json")"
+  RESOLVED_JAR_NAME="$(jq -r '(.downloads."server:default".name // empty)' <<< "$build_json")"
+  RESOLVED_DOWNLOAD_URL="$(jq -r '(.downloads."server:default".url // empty)' <<< "$build_json")"
+
+  valid_api_value "$RESOLVED_BUILD" || return 1
+  valid_api_value "$RESOLVED_JAR_NAME" || return 1
+  valid_api_value "$RESOLVED_DOWNLOAD_URL" || return 1
+
+  return 0
+}
+
+function find_latest_stable_papermc_build() {
+  local project="$1"
+  local project_url="${PAPERMC_API_BASE}/projects/${project}"
+  local project_json
+  local version
+
+  if ! project_json="$(papermc_fetch_json "$project_url" "project info for ${project}")"; then
+    return 1
+  fi
+
+  if ! jq -e '.versions | type == "object"' >/dev/null 2>&1 <<< "$project_json"; then
+    echo "Error: PaperMC project response for ${project} did not include a versions object." >&2
+    return 1
+  fi
+
+  while IFS= read -r version; do
+    [[ -z "$version" ]] && continue
+    if resolve_papermc_build "$project" "$version" ""; then
+      return 0
+    fi
+  done < <(jq -r '.versions | to_entries[] | .value[]' <<< "$project_json")
+
+  return 1
+}
+
+function prompt_for_papermc_upgrade() {
+  local current_version="$1"
+  local current_build="$2"
+  local latest_version="$3"
+  local latest_build="$4"
+  local reason="$5"
+  local confirm
+
+  [[ -t 0 ]] || return 1
+
+  echo "----------------------------------------"
+  echo "${reason}"
+  echo "Current ${PROJECT_NAME}: ${current_version:-unknown} build ${current_build:-unknown}"
+  echo "Latest stable ${PROJECT_NAME}: ${latest_version} build ${latest_build}"
+  echo
+  echo "This will perform a drop-in jar update only."
+  echo "Before accepting, make sure you have backed up your worlds and followed the proper Minecraft/Paper upgrade path."
+  echo "No world folders or server files will be removed for this auto-detected upgrade."
+  echo "Continue with this jar-only update? [y/N]"
+  read -r confirm
+  [[ "$confirm" =~ ^[yY]$ ]]
+}
+
+function apply_resolved_papermc_build() {
+  MINECRAFT_VERSION="$RESOLVED_VERSION"
+  BUILD_NUMBER="$RESOLVED_BUILD"
+  JAR_NAME="$RESOLVED_JAR_NAME"
+  DOWNLOAD_URL="$RESOLVED_DOWNLOAD_URL"
+  FILE="${SERVER_DIR}/${JAR_NAME}"
+}
+
+function fail_with_latest_stable_hint() {
+  local requested_version="$1"
+  local requested_build="$2"
+  local latest_version="$3"
+  local latest_build="$4"
+
+  if valid_api_value "$latest_version" && valid_api_value "$latest_build"; then
+    die "No valid ${PROJECT_NAME} download for version '${requested_version}' build '${requested_build:-latest stable}'. Latest stable is ${latest_version} build ${latest_build}."
+  fi
+
+  die "No valid ${PROJECT_NAME} download for version '${requested_version}' build '${requested_build:-latest stable}', and no latest stable ${PROJECT_NAME} build could be resolved."
+}
+
+function resolve_papermc_download_info() {
+  local selected_from_current_file=false
+  local current_valid=false
+  local current_version=""
+  local current_build=""
+  local current_jar_name=""
+  local current_download_url=""
+  local latest_version=""
+  local latest_build=""
+  local latest_jar_name=""
+  local latest_download_url=""
+
+  if [[ -z "$MINECRAFT_VERSION" ]]; then
+    if [[ -f "$CURRENT_VERSION_FILE" ]]; then
+      MINECRAFT_VERSION="$(< "$CURRENT_VERSION_FILE")"
+      selected_from_current_file=true
+      echo "No version specified => using $MINECRAFT_VERSION from current_version.txt"
+    else
+      echo "No version specified + no current_version.txt => resolving latest stable ${PROJECT_NAME} from PaperMC..."
+      if ! find_latest_stable_papermc_build "$PROJECT_NAME"; then
+        die "No latest stable ${PROJECT_NAME} build could be resolved from PaperMC."
+      fi
+      apply_resolved_papermc_build
+      return 0
+    fi
+  fi
+
+  if [[ "$USER_SUPPLIED_MINECRAFT_VERSION" == "true" ]]; then
+    if [[ -z "$BUILD_NUMBER" ]]; then
+      echo "No build number => fetching latest stable build for $MINECRAFT_VERSION..."
+    else
+      echo "Using requested build $BUILD_NUMBER for $MINECRAFT_VERSION..."
+    fi
+
+    if resolve_papermc_build "$PROJECT_NAME" "$MINECRAFT_VERSION" "$BUILD_NUMBER"; then
+      apply_resolved_papermc_build
+      return 0
+    fi
+
+    if find_latest_stable_papermc_build "$PROJECT_NAME"; then
+      latest_version="$RESOLVED_VERSION"
+      latest_build="$RESOLVED_BUILD"
+    fi
+    fail_with_latest_stable_hint "$MINECRAFT_VERSION" "$BUILD_NUMBER" "$latest_version" "$latest_build"
+  fi
+
+  if find_latest_stable_papermc_build "$PROJECT_NAME"; then
+    latest_version="$RESOLVED_VERSION"
+    latest_build="$RESOLVED_BUILD"
+    latest_jar_name="$RESOLVED_JAR_NAME"
+    latest_download_url="$RESOLVED_DOWNLOAD_URL"
+  else
+    die "No latest stable ${PROJECT_NAME} build could be resolved from PaperMC."
+  fi
+
+  if resolve_papermc_build "$PROJECT_NAME" "$MINECRAFT_VERSION" "$BUILD_NUMBER"; then
+    current_valid=true
+    current_version="$RESOLVED_VERSION"
+    current_build="$RESOLVED_BUILD"
+    current_jar_name="$RESOLVED_JAR_NAME"
+    current_download_url="$RESOLVED_DOWNLOAD_URL"
+  fi
+
+  if [[ "$current_valid" == "false" ]]; then
+    if prompt_for_papermc_upgrade "$MINECRAFT_VERSION" "$BUILD_NUMBER" "$latest_version" "$latest_build" "No stable ${PROJECT_NAME} download was found for the saved version."; then
+      MINECRAFT_VERSION="$latest_version"
+      BUILD_NUMBER="$latest_build"
+      JAR_NAME="$latest_jar_name"
+      DOWNLOAD_URL="$latest_download_url"
+      FILE="${SERVER_DIR}/${JAR_NAME}"
+      AUTO_DETECTED_PAPERMC_UPGRADE=true
+      return 0
+    fi
+    fail_with_latest_stable_hint "$MINECRAFT_VERSION" "$BUILD_NUMBER" "$latest_version" "$latest_build"
+  fi
+
+  if [[ "$AUTO_UPDATE" == "true" && "$selected_from_current_file" == "true" && ( "$current_version" != "$latest_version" || "$current_build" != "$latest_build" ) ]]; then
+    if prompt_for_papermc_upgrade "$current_version" "$current_build" "$latest_version" "$latest_build" "A newer stable ${PROJECT_NAME} download is available."; then
+      MINECRAFT_VERSION="$latest_version"
+      BUILD_NUMBER="$latest_build"
+      JAR_NAME="$latest_jar_name"
+      DOWNLOAD_URL="$latest_download_url"
+      FILE="${SERVER_DIR}/${JAR_NAME}"
+      AUTO_DETECTED_PAPERMC_UPGRADE=true
+      return 0
+    fi
+    echo "Keeping ${PROJECT_NAME} ${current_version} build ${current_build}."
+  fi
+
+  MINECRAFT_VERSION="$current_version"
+  BUILD_NUMBER="$current_build"
+  JAR_NAME="$current_jar_name"
+  DOWNLOAD_URL="$current_download_url"
+  FILE="${SERVER_DIR}/${JAR_NAME}"
+}
+
 remove_old_jars() {
-  # For spigot or folia, skip this function (they have separate logic).
-  if [[ "$PROJECT_NAME" == "folia" || "$PROJECT_NAME" == "spigot" ]]; then
+  if [[ "$PROJECT_NAME" == "spigot" ]]; then
     echo "[${PROJECT_NAME}] Skipping remove_old_jars..."
     return
   fi
@@ -664,55 +715,45 @@ remove_old_jars() {
 }
 
 download_jar() {
+  local tmp_file
+
+  valid_api_value "$JAR_NAME" || die "Resolved jar name is invalid: '${JAR_NAME}'"
+  valid_api_value "$DOWNLOAD_URL" || die "Resolved download URL is invalid for ${PROJECT_NAME} ${MINECRAFT_VERSION} build ${BUILD_NUMBER}."
+
+  if [[ -f "${FILE}" && "$AUTO_UPDATE" == "false" ]]; then
+    echo "Auto-update OFF => using existing ${JAR_NAME}."
+    return 0
+  fi
+
   if [[ -f "${FILE}" ]]; then
-    if [[ "$AUTO_UPDATE" == "true" ]]; then
-      echo "Auto-update ON => re-download if changed..."
-      curl -sSL "${BUILD_API_URL}/downloads/${JAR_NAME}" -o "${FILE}"
-    else
-      echo "Auto-update OFF => skip download."
-    fi
+    echo "Auto-update ON => re-download ${JAR_NAME} if changed..."
   else
     echo "Downloading ${JAR_NAME}..."
-    curl -sSL "${BUILD_API_URL}/downloads/${JAR_NAME}" -o "${FILE}"
   fi
+
+  tmp_file="$(mktemp "${SERVER_DIR}/.${JAR_NAME}.tmp.XXXXXX")" || die "Unable to create a temporary download file in ${SERVER_DIR}."
+  if ! curl -fsSL -H "User-Agent: ${PAPERMC_USER_AGENT}" "$DOWNLOAD_URL" -o "$tmp_file"; then
+    rm -f "$tmp_file"
+    die "Download failed for ${JAR_NAME} from ${DOWNLOAD_URL}."
+  fi
+
+  if [[ ! -s "$tmp_file" ]]; then
+    rm -f "$tmp_file"
+    die "Downloaded ${JAR_NAME} is empty."
+  fi
+
+  mv -f "$tmp_file" "$FILE"
+  DOWNLOAD_PERFORMED=true
 }
 
-########################################
-#      PAPER/VELOCITY BUILD INFO       #
-########################################
-
-if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" ]]; then
-  if [[ -z "$MINECRAFT_VERSION" ]]; then
-    if [[ -f "$CURRENT_VERSION_FILE" ]]; then
-      MINECRAFT_VERSION="$(< "$CURRENT_VERSION_FILE")"
-      echo "No version specified => using $MINECRAFT_VERSION from current_version.txt"
-    else
-      echo "No version specified + no current_version.txt => fetching latest from PaperMC..."
-      MINECRAFT_VERSION="$(curl -sSL "https://api.papermc.io/v2/projects/${PROJECT_NAME}" | jq -r '.versions[-1]')"
-    fi
-  fi
-
-  if [[ -z "$BUILD_NUMBER" ]]; then
-    echo "No build number => fetching latest build for $MINECRAFT_VERSION..."
-    API_URL="https://api.papermc.io/v2/projects/${PROJECT_NAME}/versions/${MINECRAFT_VERSION}"
-    BUILD_NUMBER="$(curl -sSL "${API_URL}" | jq -r '.builds[-1]')"
-  else
-    API_URL="https://api.papermc.io/v2/projects/${PROJECT_NAME}/versions/${MINECRAFT_VERSION}"
-  fi
-
-  BUILD_API_URL="${API_URL}/builds/${BUILD_NUMBER}"
-  JAR_NAME="$(curl -sSL "${BUILD_API_URL}" | jq -r '.downloads.application.name')"
-  FILE="${SERVER_DIR}/${JAR_NAME}"
-
-elif [[ "$PROJECT_NAME" == "folia" ]]; then
-  # Folia => we use 'folia-server.jar'
-  JAR_NAME="folia-server.jar"
-  FILE="${SERVER_DIR}/${JAR_NAME}"
-
+if is_papermc_project; then
+  resolve_papermc_download_info
 elif [[ "$PROJECT_NAME" == "spigot" ]]; then
   # We'll build into spigot-server.jar
   JAR_NAME="spigot-server.jar"
   FILE="${SPIGOT_BUILT_JAR}"  # same path
+else
+  die "Unsupported PROJECT_NAME '${PROJECT_NAME}'. Use paper, velocity, folia, or spigot."
 fi
 
 ########################################
@@ -740,15 +781,19 @@ function ensure_eula() {
 maybe_backup_and_clean
 
 # Build or fetch server jar as needed
-if [[ "$PROJECT_NAME" == "folia" ]]; then
-  docker_build_folia_if_needed
-elif [[ "$PROJECT_NAME" == "spigot" ]]; then
+if [[ "$PROJECT_NAME" == "spigot" ]]; then
   build_spigot_if_needed
   [[ -n "$MINECRAFT_VERSION" ]] && echo "$MINECRAFT_VERSION" > "$CURRENT_VERSION_FILE"
-elif [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "velocity" ]]; then
-  remove_old_jars
+elif is_papermc_project; then
   download_jar
+  if [[ "$DOWNLOAD_PERFORMED" == "true" ]]; then
+    remove_old_jars
+  fi
   [[ -n "$MINECRAFT_VERSION" ]] && echo "$MINECRAFT_VERSION" > "$CURRENT_VERSION_FILE"
+fi
+
+if [[ -z "$FILE" || "$FILE" == */null || ! -s "$FILE" ]]; then
+  die "Server jar is missing or empty: ${FILE:-unset}"
 fi
 
 cd "${SERVER_DIR}" || {
@@ -844,8 +889,17 @@ if [[ "$USE_TMUX" == "true" ]]; then
     echo "tmux session '$TMUX_SESSION_NAME' exists! Aborting start."
     exit 1
   fi
-  tmux new-session -d -s "$TMUX_SESSION_NAME" \
-    "${JAVA_CMD} ${SERVER_FLAGS[*]} -jar \"${FILE}\" ${EXTRA_ARGS}"
+  if ! tmux new-session -d -s "$TMUX_SESSION_NAME" \
+    "${JAVA_CMD} ${SERVER_FLAGS[*]} -jar \"${FILE}\" ${EXTRA_ARGS}"; then
+    echo "Failed to create tmux session '$TMUX_SESSION_NAME'."
+    exit 1
+  fi
+  sleep 2
+  if ! tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
+    echo "Server process exited immediately; tmux session '$TMUX_SESSION_NAME' is not running."
+    echo "Check the server output/logs in ${SERVER_DIR}/logs for details."
+    exit 1
+  fi
   echo "Server started in tmux session '$TMUX_SESSION_NAME'."
   print_connection_info
 else
