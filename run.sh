@@ -137,7 +137,7 @@ Usage:
   $(basename "$0") [subcommand] [arguments...]
 
 Subcommands:
-  start    [mc_version] [build_number] [--no-update] [--quick-upgrade|--full-upgrade] [--xms=###] [--xmx=###] [--java-cmd=...] [--no-tmux]
+  start    [mc_version] [build_number] [--no-update] [--ignore-channel-switch] [--quick-upgrade|--full-upgrade] [--xms=###] [--xmx=###] [--java-cmd=...] [--no-tmux]
   stop
   restart  [mc_version] [build_number] ...
   toggle
@@ -297,6 +297,7 @@ PAPERMC_DECLINED_STABLE_TARGET=""
 PAPERMC_DECLINED_BETA_TARGET=""
 PAPERMC_DECLINED_ALPHA_TARGET=""
 PAPERMC_PROMPT_RESULT=""
+IGNORE_CHANNEL_SWITCH=false
 UPGRADE_MODE="ask"
 XMS="${DEFAULT_XMS}"
 XMX="${DEFAULT_XMX}"
@@ -307,6 +308,9 @@ while [[ $i -lt $# ]]; do
   case "${args[$i]}" in
     --no-update)
       AUTO_UPDATE=false
+      ;;
+    --ignore-channel-switch)
+      IGNORE_CHANNEL_SWITCH=true
       ;;
     --quick-upgrade)
       UPGRADE_MODE="quick"
@@ -914,6 +918,34 @@ function format_papermc_build_label() {
   printf '%s build %s (%s)\n' "${version:-unknown}" "${build:-unknown}" "${channel:-unknown}"
 }
 
+function papermc_channel_rank() {
+  case "$1" in
+    ALPHA)
+      printf '1\n'
+      ;;
+    BETA)
+      printf '2\n'
+      ;;
+    STABLE)
+      printf '3\n'
+      ;;
+    *)
+      printf '0\n'
+      ;;
+  esac
+}
+
+function papermc_channel_is_better() {
+  local candidate_channel="$1"
+  local current_channel="$2"
+  local candidate_rank
+  local current_rank
+
+  candidate_rank="$(papermc_channel_rank "$candidate_channel")"
+  current_rank="$(papermc_channel_rank "$current_channel")"
+  (( candidate_rank > current_rank ))
+}
+
 function prompt_papermc_choice() {
   local reason="$1"
   local current_label="$2"
@@ -1049,14 +1081,6 @@ function capture_resolved_latest_beta() {
   latest_beta_download_url="$RESOLVED_DOWNLOAD_URL"
 }
 
-function capture_resolved_same_version_stable() {
-  same_version_stable_version="$RESOLVED_VERSION"
-  same_version_stable_build="$RESOLVED_BUILD"
-  same_version_stable_channel="$RESOLVED_CHANNEL"
-  same_version_stable_jar_name="$RESOLVED_JAR_NAME"
-  same_version_stable_download_url="$RESOLVED_DOWNLOAD_URL"
-}
-
 function set_papermc_target() {
   MINECRAFT_VERSION="$1"
   BUILD_NUMBER="$2"
@@ -1116,10 +1140,6 @@ function resolve_saved_papermc_build() {
 
   case "$saved_track" in
     ALPHA)
-      if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
-        capture_resolved_current
-        return 0
-      fi
       if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "ALPHA"; then
         capture_resolved_current
         return 0
@@ -1144,7 +1164,7 @@ function resolve_saved_papermc_build() {
     return 0
   fi
 
-  if [[ "$saved_track" != "BETA" ]] && resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
+  if [[ "$saved_track" != "BETA" && "$saved_track" != "ALPHA" ]] && resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
     capture_resolved_current
     return 0
   fi
@@ -1219,11 +1239,6 @@ function resolve_papermc_download_info() {
   local latest_alpha_channel=""
   local latest_alpha_jar_name=""
   local latest_alpha_download_url=""
-  local same_version_stable_version=""
-  local same_version_stable_build=""
-  local same_version_stable_channel=""
-  local same_version_stable_jar_name=""
-  local same_version_stable_download_url=""
   local saved_version=""
   local saved_build=""
   local saved_channel=""
@@ -1231,6 +1246,10 @@ function resolve_papermc_download_info() {
   local current_label
   local target_label
   local target_key
+  local channel_switch_channel
+  local channel_switch_reason
+  local channel_switch_detail
+  local channel_switch_question
 
   load_papermc_project_versions || die "No ${PROJECT_NAME} versions could be resolved from PaperMC."
 
@@ -1271,20 +1290,62 @@ function resolve_papermc_download_info() {
   resolve_saved_papermc_build "$saved_version" "$saved_build" "$saved_track" || die "No valid ${PROJECT_NAME} download found for saved version '${saved_version}' on ${saved_track} track."
   set_papermc_target "$current_version" "$current_build" "$current_channel" "$current_jar_name" "$current_download_url"
 
-  if [[ "$AUTO_UPDATE" == "true" && ( "$saved_track" == "ALPHA" || "$saved_track" == "BETA" ) && "$latest_beta_version" != "$current_version" ]]; then
-    if valid_api_value "$latest_beta_version" && papermc_version_is_newer "$latest_beta_version" "$current_version"; then
+  if [[ "$AUTO_UPDATE" == "true" && "$IGNORE_CHANNEL_SWITCH" != "true" ]]; then
+    for channel_switch_channel in STABLE BETA; do
+      papermc_channel_is_better "$channel_switch_channel" "$PAPERMC_SELECTED_CHANNEL" || continue
+      if ! resolve_papermc_build "$PROJECT_NAME" "$current_version" "" "$channel_switch_channel"; then
+        continue
+      fi
+
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
-      target_label="$(format_papermc_build_label "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
-      target_key="$(papermc_target_key "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
-      if papermc_declined_target_matches "$latest_beta_channel" "$target_key"; then
-        echo "Skipping previously declined ${latest_beta_channel} target: ${target_label}"
-      elif prompt_papermc_choice "A newer beta ${PROJECT_NAME} version is available." "$current_label" "$target_label" "This stays on a pre-STABLE track and updates to a newer BETA Minecraft/Paper version." "Switch to this newer BETA jar? [y/N]"; then
-        clear_papermc_declined_target "$latest_beta_channel"
-        set_papermc_target "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel" "$latest_beta_jar_name" "$latest_beta_download_url"
+      target_label="$(format_papermc_build_label "$RESOLVED_VERSION" "$RESOLVED_BUILD" "$RESOLVED_CHANNEL")"
+      target_key="$(papermc_target_key "$RESOLVED_VERSION" "$RESOLVED_BUILD" "$RESOLVED_CHANNEL")"
+
+      if papermc_declined_target_matches "$RESOLVED_CHANNEL" "$target_key"; then
+        echo "Skipping previously declined ${RESOLVED_CHANNEL} target: ${target_label}"
+        continue
+      fi
+
+      if [[ "$RESOLVED_CHANNEL" == "STABLE" ]]; then
+        channel_switch_reason="A STABLE build is available for this saved version."
+        channel_switch_detail="This keeps the same Minecraft/Paper version and switches from ${PAPERMC_SELECTED_CHANNEL} to STABLE. Use --ignore-channel-switch to skip channel suggestions for this run."
+        channel_switch_question="Switch this version to STABLE? [y/N]"
+      else
+        channel_switch_reason="A BETA build is available for this saved version."
+        channel_switch_detail="This keeps the same Minecraft/Paper version and switches from ${PAPERMC_SELECTED_CHANNEL} to BETA. Use --ignore-channel-switch to skip channel suggestions for this run."
+        channel_switch_question="Switch this version to BETA? [y/N]"
+      fi
+
+      if prompt_papermc_choice "$channel_switch_reason" "$current_label" "$target_label" "$channel_switch_detail" "$channel_switch_question"; then
+        clear_papermc_declined_target "$RESOLVED_CHANNEL"
+        set_papermc_target "$RESOLVED_VERSION" "$RESOLVED_BUILD" "$RESOLVED_CHANNEL" "$RESOLVED_JAR_NAME" "$RESOLVED_DOWNLOAD_URL"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
         return 0
       elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
-        record_papermc_declined_target "$latest_beta_channel" "$target_key"
+        record_papermc_declined_target "$RESOLVED_CHANNEL" "$target_key"
+      fi
+      break
+    done
+  fi
+
+  if [[ "$AUTO_UPDATE" == "true" && ( "$saved_track" == "ALPHA" || "$saved_track" == "BETA" ) && "$latest_beta_version" != "$current_version" ]]; then
+    if valid_api_value "$latest_beta_version" && papermc_version_is_newer "$latest_beta_version" "$current_version"; then
+      if [[ "$IGNORE_CHANNEL_SWITCH" == "true" && "$latest_beta_channel" != "$PAPERMC_SELECTED_CHANNEL" ]]; then
+        :
+      else
+        current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
+        target_label="$(format_papermc_build_label "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
+        target_key="$(papermc_target_key "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
+        if papermc_declined_target_matches "$latest_beta_channel" "$target_key"; then
+          echo "Skipping previously declined ${latest_beta_channel} target: ${target_label}"
+        elif prompt_papermc_choice "A newer beta ${PROJECT_NAME} version is available." "$current_label" "$target_label" "This stays on a pre-STABLE track and updates to a newer BETA Minecraft/Paper version." "Switch to this newer BETA jar? [y/N]"; then
+          clear_papermc_declined_target "$latest_beta_channel"
+          set_papermc_target "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel" "$latest_beta_jar_name" "$latest_beta_download_url"
+          AUTO_DETECTED_PAPERMC_UPGRADE=true
+          return 0
+        elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+          record_papermc_declined_target "$latest_beta_channel" "$target_key"
+        fi
       fi
     fi
   fi
@@ -1307,29 +1368,14 @@ function resolve_papermc_download_info() {
     fi
   fi
 
-  if [[ "$AUTO_UPDATE" == "true" && "$PAPERMC_SELECTED_CHANNEL" != "STABLE" ]]; then
-    if resolve_papermc_build "$PROJECT_NAME" "$current_version" "" "STABLE"; then
-      capture_resolved_same_version_stable
-      current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
-      target_label="$(format_papermc_build_label "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel")"
-      target_key="$(papermc_target_key "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel")"
-      if papermc_declined_target_matches "$same_version_stable_channel" "$target_key"; then
-        echo "Skipping previously declined ${same_version_stable_channel} target: ${target_label}"
-      elif prompt_papermc_choice "The saved ${PROJECT_NAME} version now has a STABLE build." "$current_label" "$target_label" "This keeps the same Minecraft/Paper version and switches from ALPHA to STABLE." "Switch this version to STABLE? [y/N]"; then
-        clear_papermc_declined_target "$same_version_stable_channel"
-        set_papermc_target "$same_version_stable_version" "$same_version_stable_build" "$same_version_stable_channel" "$same_version_stable_jar_name" "$same_version_stable_download_url"
-        AUTO_DETECTED_PAPERMC_UPGRADE=true
-        return 0
-      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
-        record_papermc_declined_target "$same_version_stable_channel" "$target_key"
-      fi
-    elif valid_api_value "$latest_stable_version"; then
+  if [[ "$AUTO_UPDATE" == "true" && "$IGNORE_CHANNEL_SWITCH" != "true" && "$PAPERMC_SELECTED_CHANNEL" != "STABLE" ]]; then
+    if valid_api_value "$latest_stable_version" && [[ "$latest_stable_version" != "$current_version" ]]; then
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
       target_label="$(format_papermc_build_label "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
       target_key="$(papermc_target_key "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel")"
       if papermc_declined_target_matches "$latest_stable_channel" "$target_key"; then
         echo "Skipping previously declined ${latest_stable_channel} target: ${target_label}"
-      elif prompt_papermc_choice "The saved ${PROJECT_NAME} version is still experimental; the latest stable release is different." "$current_label" "$target_label" "This switches from the ALPHA track to the latest STABLE PaperMC download." "Switch to the latest stable jar? [y/N]"; then
+      elif prompt_papermc_choice "The saved ${PROJECT_NAME} version is still pre-STABLE; the latest stable release is different." "$current_label" "$target_label" "This switches from the current pre-STABLE track to the latest STABLE PaperMC download." "Switch to the latest stable jar? [y/N]"; then
         clear_papermc_declined_target "$latest_stable_channel"
         set_papermc_target "$latest_stable_version" "$latest_stable_build" "$latest_stable_channel" "$latest_stable_jar_name" "$latest_stable_download_url"
         AUTO_DETECTED_PAPERMC_UPGRADE=true
@@ -1489,6 +1535,7 @@ echo "JAVA_MAJOR_VERSION   = ${JAVA_MAJOR_VERSION}"
 echo "USE_TMUX             = ${USE_TMUX}"
 echo "TMUX_SESSION_NAME    = ${TMUX_SESSION_NAME}"
 echo "CHECK_TAILSCALE_BIND = ${CHECK_TAILSCALE_BIND}"
+echo "IGNORE_CHANNEL_SWITCH = ${IGNORE_CHANNEL_SWITCH}"
 echo "UPGRADE_MODE         = ${UPGRADE_MODE}"
 echo "----------------------------------------"
 
