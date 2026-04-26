@@ -137,7 +137,7 @@ Usage:
   $(basename "$0") [subcommand] [arguments...]
 
 Subcommands:
-  start    [mc_version] [build_number] [--no-update] [--xms=###] [--xmx=###] [--java-cmd=...] [--no-tmux]
+  start    [mc_version] [build_number] [--no-update] [--quick-upgrade|--full-upgrade] [--xms=###] [--xmx=###] [--java-cmd=...] [--no-tmux]
   stop
   restart  [mc_version] [build_number] ...
   toggle
@@ -296,6 +296,7 @@ PAPERMC_SELECTED_CHANNEL=""
 PAPERMC_DECLINED_STABLE_TARGET=""
 PAPERMC_DECLINED_ALPHA_TARGET=""
 PAPERMC_PROMPT_RESULT=""
+UPGRADE_MODE="ask"
 XMS="${DEFAULT_XMS}"
 XMX="${DEFAULT_XMX}"
 
@@ -305,6 +306,12 @@ while [[ $i -lt $# ]]; do
   case "${args[$i]}" in
     --no-update)
       AUTO_UPDATE=false
+      ;;
+    --quick-upgrade)
+      UPGRADE_MODE="quick"
+      ;;
+    --full-upgrade)
+      UPGRADE_MODE="full"
       ;;
     --xms=*)
       XMS="${args[$i]#*=}"
@@ -601,19 +608,70 @@ backup_and_clean() {
   shopt -u dotglob
 }
 
+choose_upgrade_mode() {
+  local old_version="$1"
+  local new_version="$2"
+  local confirm
+
+  case "$UPGRADE_MODE" in
+    quick)
+      echo "Version changed from '${old_version}' to '${new_version}'."
+      echo "Quick upgrade selected => jar-only update; skipping backup/clean."
+      echo "Back up worlds first if this is not a disposable or already-backed-up server."
+      return 0
+      ;;
+    full)
+      backup_and_clean "$old_version" "$new_version"
+      return 0
+      ;;
+    ask)
+      ;;
+    *)
+      die "Invalid UPGRADE_MODE '${UPGRADE_MODE}'. Use ask, quick, or full."
+      ;;
+  esac
+
+  if [[ ! -t 0 ]]; then
+    echo "Version changed from '${old_version}' to '${new_version}'."
+    echo "Non-interactive shell detected => defaulting to quick jar-only upgrade."
+    echo "Use --full-upgrade to run the full backup/clean path."
+    return 0
+  fi
+
+  echo "----------------------------------------"
+  echo "Version changed from '${old_version}' to '${new_version}'."
+  echo "Choose upgrade mode:"
+  echo "  [q] Quick jar-only upgrade (default): do not move worlds or clean server files."
+  echo "  [f] Full backup + clean: move world folders into a timestamped backup dir, then prompt to remove old server files."
+  echo "  [c] Cancel."
+  echo "Upgrade mode [q/f/c, default q]:"
+  read -r confirm
+
+  case "$confirm" in
+    f|F|full|FULL)
+      backup_and_clean "$old_version" "$new_version"
+      ;;
+    c|C|cancel|CANCEL)
+      die "Upgrade cancelled."
+      ;;
+    *)
+      echo "Quick upgrade selected => jar-only update; skipping backup/clean."
+      echo "Back up worlds first if this is not a disposable or already-backed-up server."
+      ;;
+  esac
+}
+
 maybe_backup_and_clean() {
   # Paper, Folia, or Spigot do backups on version change
   if [[ "$PROJECT_NAME" == "paper" || "$PROJECT_NAME" == "folia" || "$PROJECT_NAME" == "spigot" ]]; then
-    if [[ "$AUTO_DETECTED_PAPERMC_UPGRADE" == "true" ]]; then
-      echo "Auto-detected PaperMC upgrade accepted => jar-only update; skipping backup/clean."
-      echo "Back up worlds and follow the proper upgrade path before running upgraded Minecraft versions in production."
-      return
-    fi
     if [[ -f "$CURRENT_VERSION_FILE" ]]; then
       local last_ver
       last_ver="$(read_current_version_value)"
       if [[ "$last_ver" != "$MINECRAFT_VERSION" && -n "$MINECRAFT_VERSION" ]]; then
-        backup_and_clean "$last_ver" "$MINECRAFT_VERSION"
+        if [[ "$AUTO_DETECTED_PAPERMC_UPGRADE" == "true" ]]; then
+          echo "Auto-detected PaperMC upgrade accepted."
+        fi
+        choose_upgrade_mode "$last_ver" "$MINECRAFT_VERSION"
       else
         echo "No version change or version not specified => no backup/clean."
       fi
@@ -868,7 +926,7 @@ function prompt_papermc_choice() {
   echo
   echo "$detail"
   echo "Before accepting, make sure you have backed up your worlds and followed the proper Minecraft/Paper upgrade path."
-  echo "No world folders or server files will be removed for this auto-detected change."
+  echo "If this changes the saved Minecraft version, you will choose quick jar-only upgrade or full backup/clean before startup."
   echo "$question"
   read -r confirm
   if [[ "$confirm" =~ ^[yY]$ ]]; then
@@ -1352,6 +1410,7 @@ echo "JAVA_MAJOR_VERSION   = ${JAVA_MAJOR_VERSION}"
 echo "USE_TMUX             = ${USE_TMUX}"
 echo "TMUX_SESSION_NAME    = ${TMUX_SESSION_NAME}"
 echo "CHECK_TAILSCALE_BIND = ${CHECK_TAILSCALE_BIND}"
+echo "UPGRADE_MODE         = ${UPGRADE_MODE}"
 echo "----------------------------------------"
 
 echo "Starting ${PROJECT_NAME} server..."
