@@ -88,7 +88,7 @@ load_config() {
           JAVA_CMD|PAPERMC_API_BASE|PAPERMC_USER_AGENT|\
           SPIGOT_BUILD_DIR|TMUX_SESSION_NAME|AUTO_AGREE_EULA|CHECK_TAILSCALE_BIND)
             if [[ -z "${!key}" ]]; then
-              declare -g "$key=$value"
+              printf -v "$key" '%s' "$value"
             fi
             ;;
         esac
