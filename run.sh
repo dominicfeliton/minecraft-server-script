@@ -294,6 +294,7 @@ AUTO_DETECTED_PAPERMC_UPGRADE=false
 DOWNLOAD_PERFORMED=false
 PAPERMC_SELECTED_CHANNEL=""
 PAPERMC_DECLINED_STABLE_TARGET=""
+PAPERMC_DECLINED_BETA_TARGET=""
 PAPERMC_DECLINED_ALPHA_TARGET=""
 PAPERMC_PROMPT_RESULT=""
 UPGRADE_MODE="ask"
@@ -720,6 +721,7 @@ function read_papermc_state() {
   PAPERMC_STATE_BUILD=""
   PAPERMC_STATE_CHANNEL=""
   PAPERMC_STATE_DECLINED_STABLE_TARGET=""
+  PAPERMC_STATE_DECLINED_BETA_TARGET=""
   PAPERMC_STATE_DECLINED_ALPHA_TARGET=""
   PAPERMC_STATE_FORMAT=""
 
@@ -743,6 +745,9 @@ function read_papermc_state() {
           ;;
         DECLINED_STABLE_TARGET)
           PAPERMC_STATE_DECLINED_STABLE_TARGET="$value"
+          ;;
+        DECLINED_BETA_TARGET)
+          PAPERMC_STATE_DECLINED_BETA_TARGET="$value"
           ;;
         DECLINED_ALPHA_TARGET)
           PAPERMC_STATE_DECLINED_ALPHA_TARGET="$value"
@@ -769,6 +774,7 @@ function write_papermc_state() {
     printf 'BUILD=%s\n' "$BUILD_NUMBER"
     printf 'CHANNEL=%s\n' "$PAPERMC_SELECTED_CHANNEL"
     printf 'DECLINED_STABLE_TARGET=%s\n' "$PAPERMC_DECLINED_STABLE_TARGET"
+    printf 'DECLINED_BETA_TARGET=%s\n' "$PAPERMC_DECLINED_BETA_TARGET"
     printf 'DECLINED_ALPHA_TARGET=%s\n' "$PAPERMC_DECLINED_ALPHA_TARGET"
   } > "$CURRENT_VERSION_FILE"
 }
@@ -954,6 +960,9 @@ function papermc_declined_target_matches() {
     ALPHA)
       [[ "$PAPERMC_DECLINED_ALPHA_TARGET" == "$target" ]]
       ;;
+    BETA)
+      [[ "$PAPERMC_DECLINED_BETA_TARGET" == "$target" ]]
+      ;;
     STABLE)
       [[ "$PAPERMC_DECLINED_STABLE_TARGET" == "$target" ]]
       ;;
@@ -971,6 +980,9 @@ function record_papermc_declined_target() {
     ALPHA)
       PAPERMC_DECLINED_ALPHA_TARGET="$target"
       ;;
+    BETA)
+      PAPERMC_DECLINED_BETA_TARGET="$target"
+      ;;
     STABLE)
       PAPERMC_DECLINED_STABLE_TARGET="$target"
       ;;
@@ -986,6 +998,9 @@ function clear_papermc_declined_target() {
   case "$channel" in
     ALPHA)
       PAPERMC_DECLINED_ALPHA_TARGET=""
+      ;;
+    BETA)
+      PAPERMC_DECLINED_BETA_TARGET=""
       ;;
     STABLE)
       PAPERMC_DECLINED_STABLE_TARGET=""
@@ -1026,6 +1041,14 @@ function capture_resolved_latest_alpha() {
   latest_alpha_download_url="$RESOLVED_DOWNLOAD_URL"
 }
 
+function capture_resolved_latest_beta() {
+  latest_beta_version="$RESOLVED_VERSION"
+  latest_beta_build="$RESOLVED_BUILD"
+  latest_beta_channel="$RESOLVED_CHANNEL"
+  latest_beta_jar_name="$RESOLVED_JAR_NAME"
+  latest_beta_download_url="$RESOLVED_DOWNLOAD_URL"
+}
+
 function capture_resolved_same_version_stable() {
   same_version_stable_version="$RESOLVED_VERSION"
   same_version_stable_build="$RESOLVED_BUILD"
@@ -1063,6 +1086,11 @@ function infer_saved_papermc_track() {
     return 0
   fi
 
+  if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
+    printf 'BETA\n'
+    return 0
+  fi
+
   if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "ALPHA"; then
     printf 'ALPHA\n'
     return 0
@@ -1086,12 +1114,37 @@ function resolve_saved_papermc_build() {
     return 0
   fi
 
-  if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "$saved_track"; then
+  case "$saved_track" in
+    ALPHA)
+      if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
+        capture_resolved_current
+        return 0
+      fi
+      if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "ALPHA"; then
+        capture_resolved_current
+        return 0
+      fi
+      ;;
+    BETA)
+      if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
+        capture_resolved_current
+        return 0
+      fi
+      ;;
+    *)
+      if resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "$saved_track"; then
+        capture_resolved_current
+        return 0
+      fi
+      ;;
+  esac
+
+  if [[ "$saved_track" != "STABLE" ]] && resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "STABLE"; then
     capture_resolved_current
     return 0
   fi
 
-  if [[ "$saved_track" != "STABLE" ]] && resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "STABLE"; then
+  if [[ "$saved_track" != "BETA" ]] && resolve_papermc_build "$PROJECT_NAME" "$saved_version" "" "BETA"; then
     capture_resolved_current
     return 0
   fi
@@ -1156,6 +1209,11 @@ function resolve_papermc_download_info() {
   local latest_stable_channel=""
   local latest_stable_jar_name=""
   local latest_stable_download_url=""
+  local latest_beta_version=""
+  local latest_beta_build=""
+  local latest_beta_channel=""
+  local latest_beta_jar_name=""
+  local latest_beta_download_url=""
   local latest_alpha_version=""
   local latest_alpha_build=""
   local latest_alpha_channel=""
@@ -1180,6 +1238,10 @@ function resolve_papermc_download_info() {
     capture_resolved_latest_stable
   fi
 
+  if find_latest_papermc_build_by_channel "BETA"; then
+    capture_resolved_latest_beta
+  fi
+
   if find_latest_papermc_build_by_channel "ALPHA"; then
     capture_resolved_latest_alpha
   fi
@@ -1198,6 +1260,7 @@ function resolve_papermc_download_info() {
   saved_build="$PAPERMC_STATE_BUILD"
   saved_channel="$PAPERMC_STATE_CHANNEL"
   PAPERMC_DECLINED_STABLE_TARGET="$PAPERMC_STATE_DECLINED_STABLE_TARGET"
+  PAPERMC_DECLINED_BETA_TARGET="$PAPERMC_STATE_DECLINED_BETA_TARGET"
   PAPERMC_DECLINED_ALPHA_TARGET="$PAPERMC_STATE_DECLINED_ALPHA_TARGET"
   echo "No version specified => using $saved_version from current_version.txt"
   if valid_api_value "$saved_build" || valid_api_value "$saved_channel"; then
@@ -1207,6 +1270,24 @@ function resolve_papermc_download_info() {
   saved_track="$(infer_saved_papermc_track "$saved_version" "$saved_build" "$saved_channel")" || die "No valid ${PROJECT_NAME} download found for saved version '${saved_version}'."
   resolve_saved_papermc_build "$saved_version" "$saved_build" "$saved_track" || die "No valid ${PROJECT_NAME} download found for saved version '${saved_version}' on ${saved_track} track."
   set_papermc_target "$current_version" "$current_build" "$current_channel" "$current_jar_name" "$current_download_url"
+
+  if [[ "$AUTO_UPDATE" == "true" && ( "$saved_track" == "ALPHA" || "$saved_track" == "BETA" ) && "$latest_beta_version" != "$current_version" ]]; then
+    if valid_api_value "$latest_beta_version" && papermc_version_is_newer "$latest_beta_version" "$current_version"; then
+      current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
+      target_label="$(format_papermc_build_label "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
+      target_key="$(papermc_target_key "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel")"
+      if papermc_declined_target_matches "$latest_beta_channel" "$target_key"; then
+        echo "Skipping previously declined ${latest_beta_channel} target: ${target_label}"
+      elif prompt_papermc_choice "A newer beta ${PROJECT_NAME} version is available." "$current_label" "$target_label" "This stays on a pre-STABLE track and updates to a newer BETA Minecraft/Paper version." "Switch to this newer BETA jar? [y/N]"; then
+        clear_papermc_declined_target "$latest_beta_channel"
+        set_papermc_target "$latest_beta_version" "$latest_beta_build" "$latest_beta_channel" "$latest_beta_jar_name" "$latest_beta_download_url"
+        AUTO_DETECTED_PAPERMC_UPGRADE=true
+        return 0
+      elif [[ "$PAPERMC_PROMPT_RESULT" == "declined" ]]; then
+        record_papermc_declined_target "$latest_beta_channel" "$target_key"
+      fi
+    fi
+  fi
 
   if [[ "$AUTO_UPDATE" == "true" && "$saved_track" == "ALPHA" && "$latest_alpha_version" != "$current_version" ]]; then
     if valid_api_value "$latest_alpha_version" && papermc_version_is_newer "$latest_alpha_version" "$current_version"; then
@@ -1226,7 +1307,7 @@ function resolve_papermc_download_info() {
     fi
   fi
 
-  if [[ "$AUTO_UPDATE" == "true" && "$saved_track" == "ALPHA" ]]; then
+  if [[ "$AUTO_UPDATE" == "true" && "$PAPERMC_SELECTED_CHANNEL" != "STABLE" ]]; then
     if resolve_papermc_build "$PROJECT_NAME" "$current_version" "" "STABLE"; then
       capture_resolved_same_version_stable
       current_label="$(format_papermc_build_label "$current_version" "$current_build" "$current_channel")"
@@ -1277,10 +1358,8 @@ function resolve_papermc_download_info() {
     fi
   fi
 
-  if [[ "$saved_track" == "ALPHA" ]]; then
-    echo "Continuing on ALPHA track: ${MINECRAFT_VERSION} build ${BUILD_NUMBER}."
-  elif [[ "$saved_track" == "STABLE" ]]; then
-    echo "Continuing on STABLE track: ${MINECRAFT_VERSION} build ${BUILD_NUMBER}."
+  if [[ "$PAPERMC_SELECTED_CHANNEL" == "ALPHA" || "$PAPERMC_SELECTED_CHANNEL" == "BETA" || "$PAPERMC_SELECTED_CHANNEL" == "STABLE" ]]; then
+    echo "Continuing on ${PAPERMC_SELECTED_CHANNEL} track: ${MINECRAFT_VERSION} build ${BUILD_NUMBER}."
   else
     echo "Continuing on ${saved_track} track: ${MINECRAFT_VERSION} build ${BUILD_NUMBER}."
   fi
