@@ -195,6 +195,44 @@ function read_server_property() {
   trim_value "${line#*=}"
 }
 
+function read_velocity_bind_port() {
+  local velocity_file="${SERVER_DIR}/velocity.toml"
+  local line
+  local bind_address
+  local port
+
+  [[ -f "$velocity_file" ]] || return 1
+  line="$(grep -m1 -E "^[[:space:]]*bind[[:space:]]*=" "$velocity_file" 2>/dev/null)" || return 1
+  bind_address="$(trim_value "${line#*=}")"
+
+  if [[ "$bind_address" =~ ^\"([^\"]+)\" ]]; then
+    bind_address="${BASH_REMATCH[1]}"
+  elif [[ "$bind_address" =~ ^\'([^\']+)\' ]]; then
+    bind_address="${BASH_REMATCH[1]}"
+  else
+    bind_address="${bind_address%%#*}"
+    bind_address="$(trim_value "$bind_address")"
+  fi
+
+  port="${bind_address##*:}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$port"
+}
+
+function resolve_connection_port() {
+  local server_port
+
+  if [[ "$PROJECT_NAME" == "velocity" ]]; then
+    server_port="$(read_velocity_bind_port || true)"
+  else
+    server_port="$(read_server_property "server-port" || true)"
+  fi
+
+  server_port="$(trim_value "$server_port")"
+  [[ -n "$server_port" ]] || server_port="25565"
+  printf '%s\n' "$server_port"
+}
+
 function is_tailscale_ipv4() {
   local ip="$1"
   local a
@@ -220,9 +258,7 @@ function tailscale_bind_preflight() {
   [[ -n "$server_ip" ]] || return 0
   is_tailscale_ipv4 "$server_ip" || return 0
 
-  server_port="$(read_server_property "server-port" || true)"
-  server_port="$(trim_value "$server_port")"
-  [[ -n "$server_port" ]] || server_port="25565"
+  server_port="$(resolve_connection_port)"
 
   if ! command -v tailscale &>/dev/null; then
     echo "Error: server.properties binds to Tailscale IP ${server_ip}:${server_port}, but the tailscale command was not found." >&2
@@ -1508,6 +1544,8 @@ if [[ -z "$FILE" || "$FILE" == */null || ! -s "$FILE" ]]; then
   die "Server jar is missing or empty: ${FILE:-unset}"
 fi
 
+CONNECTION_PORT="$(resolve_connection_port)"
+
 cd "${SERVER_DIR}" || {
   echo "Error: cd into $SERVER_DIR failed."
   exit 1
@@ -1582,6 +1620,8 @@ echo "Extra Args    : ${EXTRA_ARGS}"
 echo "----------------------------------------"
 
 function print_connection_info() {
+  local connection_port="${CONNECTION_PORT:-25565}"
+
   if is_wsl; then
     # Grab the first IP from hostname -I
     local ipAddr
@@ -1590,11 +1630,11 @@ function print_connection_info() {
       ipAddr="(WSL IP not detected automatically)"
     fi
     echo "======================================================"
-    echo "WSL DETECTED! Use ${ipAddr}:25565 to connect from your Windows host."
+    echo "WSL DETECTED! Use ${ipAddr}:${connection_port} to connect from your Windows host."
     echo "======================================================"
   else
     echo "======================================================"
-    echo "NON-WSL ENVIRONMENT! Use localhost:25565 to connect."
+    echo "NON-WSL ENVIRONMENT! Use localhost:${connection_port} to connect."
     echo "======================================================"
   fi
 }
